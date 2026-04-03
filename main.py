@@ -1,18 +1,19 @@
 """
-MNQ Trading Agent — Backend Server
+MNQ Trading Agent -- Backend Server
 Receives TradingView webhook alerts and posts to Discord.
 """
 
 import os
+import json
 import asyncio
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import aiohttp
 
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 # CONFIG
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mnq-agent-2024")
@@ -32,16 +33,16 @@ CHANNELS = {
 
 DISCORD_API = "https://discord.com/api/v10"
 
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 # APP
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 
 app = FastAPI(title="MNQ Trading Agent")
 
 
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 # DISCORD HELPERS
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 
 async def send_discord_message(channel_id: str, content: str = None, embed: dict = None):
     """Send a message to a Discord channel via bot token."""
@@ -78,12 +79,110 @@ def get_et_now():
     return et
 
 
-# ═══════════════════════════════════════════════════════════
-# SIGNAL PARSER
-# ═══════════════════════════════════════════════════════════
+# =============================================================
+# JSON SIGNAL HANDLER (v1.5+)
+# =============================================================
+
+def build_json_embed(data: dict) -> dict:
+    """Build a clean Discord embed from v1.5 JSON signal data."""
+    direction = data.get("signal", "UNKNOWN")
+    signal_type = data.get("signal_type", "TREND")
+    is_long = direction == "LONG"
+    is_squeeze = signal_type == "SQUEEZE"
+
+    # Colors
+    if is_squeeze:
+        color = 0x00CED1 if is_long else 0x9B59B6  # Teal or Purple
+    else:
+        color = 0x00FF00 if is_long else 0xFF0000  # Green or Red
+
+    # Title
+    emoji = "\U0001f7e2" if is_long else "\U0001f534"
+    type_label = "TREND CONTINUATION" if signal_type == "TREND" else "SQUEEZE BREAKOUT"
+    title = f"{emoji} MNQ {type_label} -- {direction}"
+
+    # Price levels
+    price = data.get("price", 0)
+    sl = data.get("sl", 0)
+    tp1 = data.get("tp1", 0)
+    tp2 = data.get("tp2", 0)
+    atr = data.get("atr", 0)
+    stop_pts = data.get("stop_pts", 0)
+
+    # Conditions string
+    conditions = data.get("conditions", "")
+    condition_items = [c.strip() for c in conditions.split("|") if c.strip()]
+    conditions_display = " \u00b7 ".join(condition_items)
+
+    # Nearest S/R
+    near_sr = data.get("near_sr", "")
+
+    # Build fields
+    fields = []
+
+    # Conditions - single compact line
+    if conditions_display:
+        fields.append({
+            "name": "\u2705 Conditions",
+            "value": conditions_display,
+            "inline": False,
+        })
+
+    # Price levels block
+    if price:
+        sl_arrow = "\u2b07" if is_long else "\u2b06"
+        tp_arrow = "\u2b06" if is_long else "\u2b07"
+
+        levels_text = (
+            f"\U0001f4cd **Entry:** {price:.2f}\n"
+            f"\U0001f6d1 **Stop:** {sl:.2f} ({stop_pts:.1f} pts)\n"
+            f"\U0001f3af **TP1:** {tp1:.2f} ({data.get('atr', 0) * 1.5:.1f} pts)\n"
+            f"\U0001f680 **TP2:** {tp2:.2f} ({data.get('atr', 0) * 2.5:.1f} pts)"
+        )
+        fields.append({
+            "name": "\U0001f4b0 Trade Levels",
+            "value": levels_text,
+            "inline": False,
+        })
+
+    # ATR info
+    if atr:
+        fields.append({
+            "name": "\U0001f4ca ATR",
+            "value": f"{atr:.2f} pts",
+            "inline": True,
+        })
+
+    # Nearest S/R
+    if near_sr:
+        fields.append({
+            "name": "\U0001f4cd Nearest S/R",
+            "value": near_sr,
+            "inline": True,
+        })
+
+    # Timestamp
+    et_now = get_et_now()
+    timestamp_str = et_now.strftime("%I:%M %p ET")
+    version = data.get("version", "1.5")
+
+    embed = {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"MNQ Agent v{version} \u2022 {timestamp_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    return embed
+
+
+# =============================================================
+# TEXT SIGNAL HANDLER (v1.4 fallback)
+# =============================================================
 
 def parse_signal(message: str) -> dict:
-    """Parse TradingView alert message into structured data."""
+    """Parse TradingView alert message into structured data (v1.4 text format)."""
     signal = {
         "raw": message,
         "type": "UNKNOWN",
@@ -94,7 +193,6 @@ def parse_signal(message: str) -> dict:
 
     msg_upper = message.upper()
 
-    # Determine signal type
     if "TREND LONG" in msg_upper:
         signal["type"] = "TREND"
         signal["direction"] = "LONG"
@@ -108,14 +206,12 @@ def parse_signal(message: str) -> dict:
         signal["type"] = "SQUEEZE"
         signal["direction"] = "SHORT"
 
-    # Extract details between pipes
-    if "—" in message:
-        parts = message.split("—", 1)
+    if "\u2014" in message:
+        parts = message.split("\u2014", 1)
         if len(parts) > 1:
             detail_str = parts[1]
             signal["details"] = [d.strip() for d in detail_str.split("|")]
 
-    # Extract nearest S/R
     if "Near:" in message:
         near_part = message.split("Near:")[-1].strip()
         signal["nearest_sr"] = near_part
@@ -123,44 +219,38 @@ def parse_signal(message: str) -> dict:
     return signal
 
 
-def build_signal_embed(signal: dict) -> dict:
-    """Build a rich Discord embed from a parsed signal."""
+def build_text_embed(signal: dict) -> dict:
+    """Build a Discord embed from v1.4 text signal (fallback)."""
     is_long = signal["direction"] == "LONG"
     is_squeeze = signal["type"] == "SQUEEZE"
 
-    # Colors
-    if is_long:
-        color = 0x00FF00  # Green
-    else:
-        color = 0xFF0000  # Red
-
     if is_squeeze:
-        color = 0x00CED1 if is_long else 0x9B59B6  # Teal or Purple
+        color = 0x00CED1 if is_long else 0x9B59B6
+    else:
+        color = 0x00FF00 if is_long else 0xFF0000
 
-    # Title
-    emoji = "🟢" if is_long else "🔴"
+    emoji = "\U0001f7e2" if is_long else "\U0001f534"
     type_label = "TREND CONTINUATION" if signal["type"] == "TREND" else "SQUEEZE BREAKOUT"
-    title = f"{emoji} MNQ {type_label} — {signal['direction']}"
+    title = f"{emoji} MNQ {type_label} -- {signal['direction']}"
 
-    # Build fields
     fields = []
 
-    for detail in signal["details"]:
-        if detail and "Near:" not in detail:
-            fields.append({
-                "name": "Condition",
-                "value": detail.strip(),
-                "inline": True,
-            })
+    # Conditions as single line
+    clean_details = [d.strip() for d in signal["details"] if d.strip() and "Near:" not in d]
+    if clean_details:
+        fields.append({
+            "name": "\u2705 Conditions",
+            "value": " \u00b7 ".join(clean_details),
+            "inline": False,
+        })
 
     if signal["nearest_sr"]:
         fields.append({
-            "name": "📍 Nearest S/R",
+            "name": "\U0001f4cd Nearest S/R",
             "value": signal["nearest_sr"],
             "inline": False,
         })
 
-    # Timestamp
     et_now = get_et_now()
     timestamp_str = et_now.strftime("%I:%M %p ET")
 
@@ -168,29 +258,28 @@ def build_signal_embed(signal: dict) -> dict:
         "title": title,
         "color": color,
         "fields": fields,
-        "footer": {"text": f"MNQ Agent v1.4 • {timestamp_str}"},
+        "footer": {"text": f"MNQ Agent v1.4 \u2022 {timestamp_str}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     return embed
 
 
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 # ROUTES
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 
 @app.get("/")
 async def root():
     """Health check."""
-    return {"status": "MNQ Agent running", "version": "1.4"}
+    return {"status": "MNQ Agent running", "version": "1.5"}
 
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """
     Receive TradingView webhook alert.
-    
-    TradingView sends a POST with the alert message in the body.
+    Handles both JSON (v1.5+) and plain text (v1.4) formats.
     """
     try:
         body = await request.body()
@@ -201,82 +290,106 @@ async def receive_webhook(request: Request):
 
         print(f"Received webhook: {message}")
 
-        # Parse the signal
-        signal = parse_signal(message)
+        # Try JSON first (v1.5), fall back to text (v1.4)
+        embed = None
+        signal_type = "UNKNOWN"
+        direction = "UNKNOWN"
 
-        # Build the embed
-        embed = build_signal_embed(signal)
+        try:
+            data = json.loads(message)
+            # v1.5 JSON format
+            embed = build_json_embed(data)
+            signal_type = data.get("signal_type", "UNKNOWN")
+            direction = data.get("signal", "UNKNOWN")
+            print(f"Parsed as JSON (v1.5): {signal_type} {direction}")
+        except (json.JSONDecodeError, ValueError):
+            # v1.4 text format fallback
+            signal = parse_signal(message)
+            embed = build_text_embed(signal)
+            signal_type = signal["type"]
+            direction = signal["direction"]
+            print(f"Parsed as text (v1.4): {signal_type} {direction}")
 
-        # Determine which channel to post to
-        # TREND signals → alerts-high (confirmed trend)
-        # SQUEEZE signals → alerts-high (breakout confirmed)
+        # Send to alerts-high channel
         channel_id = CHANNELS.get("alerts-high")
-
-        # Send to Discord
         result = await send_discord_message(channel_id, embed=embed)
 
         # Log to system-log channel
         log_channel = CHANNELS.get("system-log")
         if log_channel:
             et_now = get_et_now()
-            log_msg = f"📋 `{et_now.strftime('%H:%M ET')}` Signal received: **{signal['type']} {signal['direction']}**"
+            log_msg = f"\U0001f4cb `{et_now.strftime('%H:%M ET')}` Signal received: **{signal_type} {direction}**"
             await send_discord_message(log_channel, content=log_msg)
 
         return JSONResponse(
             status_code=200,
             content={
                 "status": "ok",
-                "signal_type": signal["type"],
-                "direction": signal["direction"],
+                "signal_type": signal_type,
+                "direction": direction,
             },
         )
 
     except Exception as e:
         print(f"Webhook error: {e}")
-        # Log error to system-log
         log_channel = CHANNELS.get("system-log")
         if log_channel:
             await send_discord_message(
                 log_channel,
-                content=f"❌ Webhook error: `{str(e)}`",
+                content=f"\u274c Webhook error: `{str(e)}`",
             )
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/test")
 async def test_alert():
-    """Send a test alert to verify Discord connection."""
-    test_message = "MNQ TREND LONG — VWAP Bull | EMA Bull Stack | 1H Bullish | StochRSI Curl Up | Near: Pivot R1 24200.00"
+    """Send a test alert to verify Discord connection -- uses v1.5 JSON format."""
+    test_data = {
+        "signal": "LONG",
+        "signal_type": "TREND",
+        "price": 19250.00,
+        "sl": 19181.50,
+        "tp1": 19343.25,
+        "tp2": 19406.25,
+        "stop_pts": 68.50,
+        "atr": 62.27,
+        "vwap": 19200.00,
+        "ema9": 19240.00,
+        "ema21": 19220.00,
+        "adx": 28.5,
+        "stoch_k": 42.3,
+        "near_sr": "Pivot PP 19225.50",
+        "conditions": "VWAP Bull | EMA Bull Stack | 1H Bullish | StochRSI Curl Up | ADX Trending",
+        "volume_ratio": 1.35,
+        "version": "1.5",
+    }
 
-    signal = parse_signal(test_message)
-    embed = build_signal_embed(signal)
+    embed = build_json_embed(test_data)
 
     channel_id = CHANNELS.get("alerts-high")
     result = await send_discord_message(channel_id, embed=embed)
 
     if result:
-        # Also log it
         log_channel = CHANNELS.get("system-log")
         if log_channel:
             await send_discord_message(
                 log_channel,
-                content="✅ Test alert sent successfully",
+                content="\u2705 Test alert sent successfully (v1.5 format)",
             )
         return {"status": "Test alert sent"}
     else:
         return {"status": "Failed to send test alert"}
 
 
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 # STARTUP
-# ═══════════════════════════════════════════════════════════
+# =============================================================
 
 @app.on_event("startup")
 async def startup():
     """Log startup to system-log channel."""
     print("MNQ Agent starting up...")
 
-    # Verify config
     missing = []
     if not DISCORD_BOT_TOKEN:
         missing.append("DISCORD_BOT_TOKEN")
@@ -293,5 +406,5 @@ async def startup():
             et_now = get_et_now()
             await send_discord_message(
                 log_channel,
-                content=f"🟢 **MNQ Agent v1.4 online** — {et_now.strftime('%B %d, %Y %I:%M %p ET')}",
+                content=f"\U0001f7e2 **MNQ Agent v1.5 online** -- {et_now.strftime('%B %d, %Y %I:%M %p ET')}",
             )
