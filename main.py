@@ -80,11 +80,11 @@ def get_et_now():
 
 
 # =============================================================
-# JSON SIGNAL HANDLER (v1.5+)
+# JSON SIGNAL HANDLERS (v2.0)
 # =============================================================
 
 def build_json_embed(data: dict) -> dict:
-    """Build a clean Discord embed from v1.5 JSON signal data."""
+    """Build a clean Discord embed from v2.0 JSON signal data (ACTIONABLE ENTRIES)."""
     direction = data.get("signal", "UNKNOWN")
     signal_type = data.get("signal_type", "TREND")
     is_long = direction == "LONG"
@@ -109,6 +109,10 @@ def build_json_embed(data: dict) -> dict:
     atr = data.get("atr", 0)
     stop_pts = data.get("stop_pts", 0)
 
+    # Reputation
+    reputation = data.get("reputation", "")
+    consec_stops = data.get("consecutive_stops", 0)
+
     # Conditions string
     conditions = data.get("conditions", "")
     condition_items = [c.strip() for c in conditions.split("|") if c.strip()]
@@ -120,7 +124,6 @@ def build_json_embed(data: dict) -> dict:
     # Build fields
     fields = []
 
-    # Conditions - single compact line
     if conditions_display:
         fields.append({
             "name": "\u2705 Conditions",
@@ -128,11 +131,7 @@ def build_json_embed(data: dict) -> dict:
             "inline": False,
         })
 
-    # Price levels block
     if price:
-        sl_arrow = "\u2b07" if is_long else "\u2b06"
-        tp_arrow = "\u2b06" if is_long else "\u2b07"
-
         levels_text = (
             f"\U0001f4cd **Entry:** {price:.2f}\n"
             f"\U0001f6d1 **Stop:** {sl:.2f} ({stop_pts:.1f} pts)\n"
@@ -145,7 +144,6 @@ def build_json_embed(data: dict) -> dict:
             "inline": False,
         })
 
-    # ATR info
     if atr:
         fields.append({
             "name": "\U0001f4ca ATR",
@@ -153,7 +151,6 @@ def build_json_embed(data: dict) -> dict:
             "inline": True,
         })
 
-    # Nearest S/R
     if near_sr:
         fields.append({
             "name": "\U0001f4cd Nearest S/R",
@@ -161,10 +158,16 @@ def build_json_embed(data: dict) -> dict:
             "inline": True,
         })
 
-    # Timestamp
+    if reputation:
+        fields.append({
+            "name": "\U0001f9e0 Mona's Conviction",
+            "value": f"**{reputation}** (Consecutive Stops: {consec_stops})",
+            "inline": False,
+        })
+
     et_now = get_et_now()
     timestamp_str = et_now.strftime("%I:%M %p ET")
-    version = data.get("version", "1.5")
+    version = data.get("version", "2.0")
 
     embed = {
         "title": title,
@@ -174,6 +177,42 @@ def build_json_embed(data: dict) -> dict:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
+    return embed
+
+
+def build_eval_embed(data: dict) -> dict:
+    """Build a Discord embed for Mona's 4-bar evaluation results (JOURNAL)."""
+    direction = data.get("signal", "UNKNOWN")
+    signal_type = data.get("signal_type", "UNKNOWN")
+    result = data.get("result", "FAIL")
+
+    is_pass = (result == "PASS")
+    color = 0x00FF00 if is_pass else 0xFF0000
+    icon = "\u2705" if is_pass else "\u274c"  # Green check / Red X
+
+    title = f"{icon} EVAL {result} -- {signal_type} {direction}"
+
+    price = data.get("price", 0)
+    target = data.get("follow_thru_target", 0)
+    rep = data.get("reputation", "UNKNOWN")
+    stops = data.get("consecutive_stops", 0)
+
+    fields = [
+        {"name": "Signal Price", "value": f"{price:.2f}", "inline": True},
+        {"name": "Target Hit?", "value": f"{target:.2f}", "inline": True},
+        {"name": "\U0001f9e0 New Reputation", "value": f"**{rep}** (Stops: {stops})", "inline": False}
+    ]
+
+    et_now = get_et_now()
+    timestamp_str = et_now.strftime("%I:%M %p ET")
+
+    embed = {
+        "title": title,
+        "color": color,
+        "fields": fields,
+        "footer": {"text": f"MNQ Agent v2.0 \u2022 {timestamp_str}"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
     return embed
 
 
@@ -235,7 +274,6 @@ def build_text_embed(signal: dict) -> dict:
 
     fields = []
 
-    # Conditions as single line
     clean_details = [d.strip() for d in signal["details"] if d.strip() and "Near:" not in d]
     if clean_details:
         fields.append({
@@ -272,14 +310,14 @@ def build_text_embed(signal: dict) -> dict:
 @app.get("/")
 async def root():
     """Health check."""
-    return {"status": "MNQ Agent running", "version": "1.5"}
+    return {"status": "MNQ Agent running", "version": "2.0"}
 
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     """
     Receive TradingView webhook alert.
-    Handles both JSON (v1.5+) and plain text (v1.4) formats.
+    Routes ENTRY to alerts-high, EVAL_RESULT to trade-journal.
     """
     try:
         body = await request.body()
@@ -290,41 +328,58 @@ async def receive_webhook(request: Request):
 
         print(f"Received webhook: {message}")
 
-        # Try JSON first (v1.5), fall back to text (v1.4)
         embed = None
         signal_type = "UNKNOWN"
         direction = "UNKNOWN"
+        status = "ENTRY"
+        log_action = "Signal"
+        target_channel_id = None
 
         try:
             data = json.loads(message)
-            # v1.5 JSON format
-            embed = build_json_embed(data)
+            status = data.get("status", "ENTRY")
             signal_type = data.get("signal_type", "UNKNOWN")
             direction = data.get("signal", "UNKNOWN")
-            print(f"Parsed as JSON (v1.5): {signal_type} {direction}")
+
+            # Route 1: Mona's Homework
+            if status == "EVAL_RESULT":
+                embed = build_eval_embed(data)
+                target_channel_id = CHANNELS.get("trade-journal")
+                log_action = "Evaluation"
+            
+            # Route 2: Actionable Trade
+            else:
+                embed = build_json_embed(data)
+                target_channel_id = CHANNELS.get("alerts-high")
+                log_action = "Signal"
+
+            print(f"Parsed as JSON (v2.0): {status} - {signal_type} {direction}")
+
         except (json.JSONDecodeError, ValueError):
-            # v1.4 text format fallback
+            # v1.4 fallback
             signal = parse_signal(message)
             embed = build_text_embed(signal)
             signal_type = signal["type"]
             direction = signal["direction"]
+            target_channel_id = CHANNELS.get("alerts-high")
             print(f"Parsed as text (v1.4): {signal_type} {direction}")
 
-        # Send to alerts-high channel
-        channel_id = CHANNELS.get("alerts-high")
-        result = await send_discord_message(channel_id, embed=embed)
+        # Send to the appropriate Discord channel
+        if target_channel_id:
+            await send_discord_message(target_channel_id, embed=embed)
 
         # Log to system-log channel
         log_channel = CHANNELS.get("system-log")
         if log_channel:
             et_now = get_et_now()
-            log_msg = f"\U0001f4cb `{et_now.strftime('%H:%M ET')}` Signal received: **{signal_type} {direction}**"
+            log_msg = f"\U0001f4cb `{et_now.strftime('%H:%M ET')}` {log_action} received: **{signal_type} {direction}**"
             await send_discord_message(log_channel, content=log_msg)
 
         return JSONResponse(
             status_code=200,
             content={
                 "status": "ok",
+                "action_taken": log_action,
                 "signal_type": signal_type,
                 "direction": direction,
             },
@@ -343,7 +398,7 @@ async def receive_webhook(request: Request):
 
 @app.post("/test")
 async def test_alert():
-    """Send a test alert to verify Discord connection -- uses v1.5 JSON format."""
+    """Send a test alert to verify Discord connection -- uses v2.0 JSON format."""
     test_data = {
         "signal": "LONG",
         "signal_type": "TREND",
@@ -361,7 +416,10 @@ async def test_alert():
         "near_sr": "Pivot PP 19225.50",
         "conditions": "VWAP Bull | EMA Bull Stack | 1H Bullish | StochRSI Curl Up | ADX Trending",
         "volume_ratio": 1.35,
-        "version": "1.5",
+        "reputation": "ELIGIBLE",
+        "consecutive_stops": 0,
+        "version": "2.0",
+        "status": "ENTRY"
     }
 
     embed = build_json_embed(test_data)
@@ -374,7 +432,7 @@ async def test_alert():
         if log_channel:
             await send_discord_message(
                 log_channel,
-                content="\u2705 Test alert sent successfully (v1.5 format)",
+                content="\u2705 Test alert sent successfully (v2.0 format)",
             )
         return {"status": "Test alert sent"}
     else:
@@ -406,5 +464,5 @@ async def startup():
             et_now = get_et_now()
             await send_discord_message(
                 log_channel,
-                content=f"\U0001f7e2 **MNQ Agent v1.5 online** -- {et_now.strftime('%B %d, %Y %I:%M %p ET')}",
+                content=f"\U0001f7e2 **MNQ Agent v2.0 (Mona) online** -- {et_now.strftime('%B %d, %Y %I:%M %p ET')}",
             )
