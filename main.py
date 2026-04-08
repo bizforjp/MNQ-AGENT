@@ -2,13 +2,23 @@
 The Mona v2.0 — Backend Server
 Receives TradingView webhook alerts, logs to SQLite, posts to Discord.
 Supports both alert() and alertcondition() webhook formats.
+
+Fixes applied (April 8, 2026 audit):
+  - JSON sanitization before parsing (BLOCKER 1 fix)
+  - Raw payload logging on parse failure (diagnostic)
+  - Error isolation: DB commit before Discord post (no duplicate rows)
+  - Timestamp format normalized for SQLite compatibility
+  - Timezone via zoneinfo (handles EST/EDT automatically)
+  - Health check endpoint
 """
 
 import os
+import re
 import json
 import sqlite3
 import asyncio
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import aiohttp
@@ -19,7 +29,7 @@ import aiohttp
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-# Channel IDs — these match the env vars already set in Railway
+# Channel IDs — match env vars in Railway
 CHANNELS = {
     "alerts-high":   os.getenv("CH_ALERTS_HIGH"),
     "trade-journal": os.getenv("CH_TRADE_JOURNAL"),
@@ -32,9 +42,35 @@ DISCORD_API = "https://discord.com/api/v10"
 DB_DIR = "/app/data" if os.path.exists("/app") else "."
 DB_PATH = os.path.join(DB_DIR, "signals.db")
 
+# Eastern timezone — handles EST/EDT automatically
+ET = ZoneInfo("America/New_York")
+
 
 # =============================================================
-# TRANSLATOR — alertcondition numeric codes → string labels
+# JSON SANITIZATION — BLOCKER 1 FIX
+# =============================================================
+
+def sanitize_json(raw: str) -> str:
+    """
+    Clean TradingView alertcondition payload before JSON parsing.
+    TradingView's template engine can insert NaN, Infinity, or empty
+    values that break json.loads(). This catches all known cases.
+    """
+    cleaned = raw
+    # Replace JavaScript-style invalid values with valid JSON
+    cleaned = re.sub(r'\bNaN\b', '0', cleaned)
+    cleaned = re.sub(r'-Infinity\b', '0', cleaned)
+    cleaned = re.sub(r'\bInfinity\b', '0', cleaned)
+    # Fix empty values: "key":, or "key":}
+    cleaned = re.sub(r':\s*,', ':0,', cleaned)
+    cleaned = re.sub(r':\s*}', ':0}', cleaned)
+    # Fix trailing commas before closing brace: ,}
+    cleaned = re.sub(r',\s*}', '}', cleaned)
+    return cleaned
+
+
+# =============================================================
+# HELPERS
 # =============================================================
 
 def safe_float(val, default=0.0):
@@ -47,6 +83,20 @@ def safe_float(val, default=0.0):
     except (TypeError, ValueError):
         return default
 
+
+def get_et_now():
+    """Current time in Eastern. Handles EST/EDT automatically."""
+    return datetime.now(ET)
+
+
+def get_utc_timestamp():
+    """UTC timestamp formatted for SQLite compatibility."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+# =============================================================
+# TRANSLATOR — alertcondition numeric codes → string labels
+# =============================================================
 
 def translate_signal_codes(data):
     """
@@ -75,7 +125,7 @@ def translate_signal_codes(data):
     # Derive conditions string from signal type
     data["conditions"] = "VWAP|Stack|HTF|Stoch|ADX" if data["signal_type"] == "TREND" else "SQZ|Price|Cross|Stoch"
 
-    # Normalize all numeric fields (TradingView may send as strings)
+    # Normalize all numeric fields
     for key in ["price", "sl", "tp1", "tp2", "stop_pts", "atr", "vwap",
                 "ema9", "ema21", "adx", "stoch_k", "near_sr", "rr1", "rr2", "volume_ratio"]:
         if key in data:
@@ -164,18 +214,17 @@ async def send_discord_message(channel_id, content=None, embed=None):
     if embed:
         payload["embeds"] = [embed]
 
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status in (200, 201):
-                return await resp.json()
-            else:
-                print(f"Discord error {resp.status}: {await resp.text()}")
-                return None
-
-
-def get_et_now():
-    """Current time in Eastern."""
-    return datetime.now(timezone.utc) - timedelta(hours=4)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status in (200, 201):
+                    return await resp.json()
+                else:
+                    print(f"Discord error {resp.status}: {await resp.text()}")
+                    return None
+    except Exception as e:
+        print(f"Discord send failed: {e}")
+        return None
 
 
 # =============================================================
@@ -199,7 +248,6 @@ def build_entry_embed(data, signal_id):
     fields = []
 
     if data.get("price"):
-        atr = safe_float(data.get("atr"))
         levels_text = (
             f"\U0001f4cd **Entry:** {data['price']:.2f}\n"
             f"\U0001f6d1 **Stop:** {safe_float(data.get('sl')):.2f} ({safe_float(data.get('stop_pts')):.1f} pts)\n"
@@ -252,26 +300,46 @@ def build_eval_embed(data, signal_id):
 app = FastAPI(title="The Mona v2.0")
 
 
+@app.get("/")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok", "version": "2.0"}
+
+
 @app.post("/webhook")
 async def receive_webhook(request: Request):
     body = await request.body()
-    message = body.decode("utf-8").strip()
-    if not message:
+    raw_message = body.decode("utf-8").strip()
+
+    if not raw_message:
         raise HTTPException(status_code=400, detail="Empty message")
 
+    # ---- PHASE 1: Parse (can fail — log raw payload if it does) ----
+
     try:
-        data = json.loads(message)
+        cleaned = sanitize_json(raw_message)
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        # Log the raw payload so we can see exactly what broke
+        error_msg = f"\u274c **JSON Parse Error** at char {e.pos}:\n```\n{raw_message[:800]}\n```"
+        print(f"JSON parse error: {e}")
+        print(f"Raw payload: {raw_message}")
+        await send_discord_message(CHANNELS.get("system-log"), content=error_msg)
+        raise HTTPException(status_code=400, detail=f"JSON parse error at char {e.pos}: {str(e)}")
 
-        # Translate alertcondition numeric codes (passes through if already string format)
-        data = translate_signal_codes(data)
+    # ---- PHASE 2: Translate + DB Write (must succeed before Discord) ----
 
-        status      = data.get("status", "ENTRY")
-        signal_type = data.get("signal_type", "UNKNOWN")
-        direction   = data.get("signal", "UNKNOWN")
-        timestamp   = datetime.now(timezone.utc).isoformat()
+    data = translate_signal_codes(data)
 
-        signal_id = None
+    status      = data.get("status", "ENTRY")
+    signal_type = data.get("signal_type", "UNKNOWN")
+    direction   = data.get("signal", "UNKNOWN")
+    timestamp   = get_utc_timestamp()
 
+    signal_id = None
+    embed = None
+
+    try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
 
@@ -306,16 +374,14 @@ async def receive_webhook(request: Request):
                 signal_id = c.lastrowid
                 conn.commit()
 
-                # Build embed with Signal ID in footer → post to alerts-high
                 embed = build_entry_embed(data, signal_id)
-                await send_discord_message(CHANNELS.get("alerts-high"), embed=embed)
 
             # ============ ROUTE 2: EVAL_RESULT — trade journal ============
             elif status == "EVAL_RESULT":
                 # Lookback Matcher: find parent signal by type + direction + 2hr window
                 c.execute('''SELECT id FROM signals
                              WHERE signal_type = ? AND signal = ?
-                               AND timestamp >= datetime('now', '-2 hours')
+                               AND timestamp >= strftime('%Y-%m-%d %H:%M:%S', 'now', '-2 hours')
                              ORDER BY id DESC LIMIT 1''',
                           (signal_type, direction))
                 row = c.fetchone()
@@ -340,27 +406,39 @@ async def receive_webhook(request: Request):
 
                 conn.commit()
 
-                # Build eval embed → post to trade-journal
                 embed = build_eval_embed(data, signal_id)
-                await send_discord_message(CHANNELS.get("trade-journal"), embed=embed)
 
-        # Log to system-log
+    except Exception as e:
+        # Database error — log it, don't proceed to Discord
+        error_msg = f"\u274c **DB Error:** {str(e)}"
+        print(f"Database error: {e}")
+        await send_discord_message(CHANNELS.get("system-log"), content=error_msg)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # ---- PHASE 3: Discord posting (non-critical — failures logged, not raised) ----
+
+    if embed:
+        target_channel = CHANNELS.get("alerts-high") if status == "ENTRY" else CHANNELS.get("trade-journal")
+        try:
+            await send_discord_message(target_channel, embed=embed)
+        except Exception as e:
+            print(f"Discord embed post failed: {e}")
+            await send_discord_message(
+                CHANNELS.get("system-log"),
+                content=f"\u26a0\ufe0f **Discord post failed** for {status} #{signal_id}: {str(e)}"
+            )
+
+    # System log — always fires, failure is silent
+    try:
         await send_discord_message(
             CHANNELS.get("system-log"),
             content=f"\U0001f4e5 `{get_et_now().strftime('%I:%M %p ET')}` {status}: {signal_type} {direction}"
                     + (f" | Signal #{signal_id}" if signal_id else "")
         )
+    except Exception:
+        pass  # System log failure is truly non-critical
 
-        return {"status": "ok", "action": status, "signal_id": signal_id}
-
-    except Exception as e:
-        print(f"Webhook error: {e}")
-        # Log error to system-log
-        await send_discord_message(
-            CHANNELS.get("system-log"),
-            content=f"\u274c **Error:** {str(e)}"
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "ok", "action": status, "signal_id": signal_id}
 
 
 # =============================================================
