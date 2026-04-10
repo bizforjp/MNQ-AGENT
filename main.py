@@ -212,6 +212,30 @@ def init_db():
             FOREIGN KEY (signal_id) REFERENCES signals(id)
         )''')
 
+        # --- Column migration ---
+        # If the signals table was created by an older main.py version,
+        # it may be missing columns added later (e.g. rr1, rr2).
+        # ALTER TABLE adds them without touching existing data.
+        c.execute("PRAGMA table_info(signals)")
+        existing_cols = {row[1] for row in c.fetchall()}
+
+        migrations = {
+            "rr1":          "REAL",
+            "rr2":          "REAL",
+            "volume_ratio": "REAL",
+            "near_sr":      "REAL",
+            "conditions":   "TEXT",
+            "outcome":      "TEXT DEFAULT 'PENDING'",
+            "exit_price":   "REAL",
+            "pnl_points":   "REAL",
+            "notes":        "TEXT",
+        }
+
+        for col, col_type in migrations.items():
+            if col not in existing_cols:
+                c.execute(f"ALTER TABLE signals ADD COLUMN {col} {col_type}")
+                print(f"Migration: added column '{col}' to signals table")
+
         conn.commit()
 
 
