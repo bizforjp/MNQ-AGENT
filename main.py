@@ -1,5 +1,5 @@
 """
-The Mona v2.0 — Backend Server
+The Mona v2.1 — Backend Server
 Receives TradingView webhook alerts, logs to SQLite, posts to Discord.
 Supports both alert() and alertcondition() webhook formats.
 
@@ -10,6 +10,13 @@ Fixes applied (April 8, 2026 audit):
   - Timestamp format normalized for SQLite compatibility
   - Timezone via zoneinfo (handles EST/EDT automatically)
   - Health check endpoint
+
+Updates applied (April 9, 2026 — Workshop #1):
+  - Template tag sanitization (catches unresolved {{plot_NN}} from TradingView)
+
+Pre-observation hardening (April 9, 2026 — Workshop #2):
+  - Webhook auth token validation via URL query param (?token=xxx)
+  - SQLite WAL mode enabled in init_db() for durability + concurrent reads
 """
 
 import os
@@ -28,6 +35,11 @@ import aiohttp
 # =============================================================
 
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# Webhook auth token — shared secret with TradingView alert URL
+# If unset, validation is skipped (backwards-compatible deployment)
+# To enable: set env var in Railway, then update TradingView alert URL to ?token=xxx
+WEBHOOK_AUTH_TOKEN = os.getenv("WEBHOOK_AUTH_TOKEN")
 
 # Channel IDs — match env vars in Railway
 CHANNELS = {
@@ -53,10 +65,14 @@ ET = ZoneInfo("America/New_York")
 def sanitize_json(raw: str) -> str:
     """
     Clean TradingView alertcondition payload before JSON parsing.
-    TradingView's template engine can insert NaN, Infinity, or empty
-    values that break json.loads(). This catches all known cases.
+    TradingView's template engine can insert NaN, Infinity, empty values,
+    or fail to resolve {{plot()}} tags entirely. This catches all known cases.
     """
     cleaned = raw
+    # Catch unresolved TradingView template tags that leak through as literal strings
+    # (e.g. {{plot_20}} or {{plot("name")}}) — replace with 0
+    # This is the BLOCKER 1 root cause from April 9, 2026
+    cleaned = re.sub(r'\{\{[^}]*\}\}', '0', cleaned)
     # Replace JavaScript-style invalid values with valid JSON
     cleaned = re.sub(r'\bNaN\b', '0', cleaned)
     cleaned = re.sub(r'-Infinity\b', '0', cleaned)
@@ -143,6 +159,12 @@ def init_db():
     os.makedirs(DB_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
+
+        # Enable Write-Ahead Logging — better durability + concurrent reads.
+        # WAL is persistent on the file, so this only needs to run once,
+        # but running on every startup is harmless and safer.
+        c.execute('PRAGMA journal_mode=WAL')
+        c.execute('PRAGMA synchronous=NORMAL')  # Balanced durability/performance for WAL
 
         # Full signal context — every indicator value at time of signal
         c.execute('''CREATE TABLE IF NOT EXISTS signals (
@@ -267,7 +289,7 @@ def build_entry_embed(data, signal_id):
         "title": f"{emoji} MNQ {type_label} — {direction}",
         "color": color,
         "fields": fields,
-        "footer": {"text": f"The Mona v2.0 \u2022 Signal ID: #{signal_id} \u2022 {et_now.strftime('%I:%M %p ET')}"},
+        "footer": {"text": f"The Mona v2.1 \u2022 Signal ID: #{signal_id} \u2022 {et_now.strftime('%I:%M %p ET')}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -288,7 +310,7 @@ def build_eval_embed(data, signal_id):
         "title": f"{icon} EVAL {data.get('result', 'UNKNOWN')} — {data.get('signal_type', '')} {data.get('signal', '')}",
         "color": color,
         "fields": fields,
-        "footer": {"text": f"The Mona v2.0 \u2022 Parent ID: #{signal_id if signal_id else 'N/A'}"},
+        "footer": {"text": f"The Mona v2.1 \u2022 Parent ID: #{signal_id if signal_id else 'N/A'}"},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -297,17 +319,25 @@ def build_eval_embed(data, signal_id):
 # WEBHOOK HANDLER
 # =============================================================
 
-app = FastAPI(title="The Mona v2.0")
+app = FastAPI(title="The Mona v2.1")
 
 
 @app.get("/")
 async def health():
     """Health check endpoint."""
-    return {"status": "ok", "version": "2.0"}
+    return {"status": "ok", "version": "2.1", "auth_enabled": bool(WEBHOOK_AUTH_TOKEN)}
 
 
 @app.post("/webhook")
-async def receive_webhook(request: Request):
+async def receive_webhook(request: Request, token: str = ""):
+    # ---- PHASE 0: Auth (rejects before any parsing or DB work) ----
+    # If WEBHOOK_AUTH_TOKEN env var is unset, skip validation entirely (backwards-compat).
+    # If set, the request must include ?token=xxx matching the env var or get a 401.
+    if WEBHOOK_AUTH_TOKEN:
+        if not token or token != WEBHOOK_AUTH_TOKEN:
+            print(f"Auth failed: missing or invalid token from {request.client.host if request.client else 'unknown'}")
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     body = await request.body()
     raw_message = body.decode("utf-8").strip()
 
@@ -449,8 +479,10 @@ async def receive_webhook(request: Request):
 async def startup():
     init_db()
     print(f"Database initialized at {DB_PATH}")
+    print(f"Webhook auth: {'ENABLED' if WEBHOOK_AUTH_TOKEN else 'DISABLED (set WEBHOOK_AUTH_TOKEN env var to enable)'}")
     et_now = get_et_now()
+    auth_status = "🔒 AUTH" if WEBHOOK_AUTH_TOKEN else "🔓 OPEN"
     await send_discord_message(
         CHANNELS.get("system-log"),
-        content=f"\U0001f7e2 **The Mona v2.0 DB Connected** — {et_now.strftime('%I:%M %p ET')}"
+        content=f"\U0001f7e2 **The Mona v2.1 DB Connected** — {et_now.strftime('%I:%M %p ET')} • {auth_status} • WAL ON"
     )
