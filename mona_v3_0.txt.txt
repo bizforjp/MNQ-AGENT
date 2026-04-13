@@ -1,0 +1,759 @@
+//@version=5
+indicator("MNQ Agent v3.0 — Reputation Engine", overlay=true, max_labels_count=500, max_bars_back=500)
+
+// ============================================================================
+// THE MONA v3.0 — Signal Generator
+// ============================================================================
+// Changes from v2.1:
+//   - Version bumped to 3.0 in alert payload
+//   - Added plots: ema50, stoch_d, htf_bull, session_minute
+//   - Added eval-only plots: ft_high, ft_low, move_points, is_ghost,
+//     state_before, state_after (for the three-table schema)
+//   - Alert template uses numeric plot indices ({{plot_N}}) instead of named
+//     references to work around TradingView's 20-plot named-reference limit
+//   - Tracks ft_high and ft_low bar-by-bar during each eval window
+//   - Zero logic changes: same Reputation Engine, same filters, same visuals
+// ============================================================================
+
+
+// ========================== INPUTS ==========================================
+
+ema9Len   = input.int(9,   "EMA 9 Length",  group="EMAs")
+ema21Len  = input.int(21,  "EMA 21 Length", group="EMAs")
+ema50Len  = input.int(50,  "EMA 50 Length", group="EMAs")
+
+rsiLen    = input.int(14,  "RSI Length",    group="StochRSI")
+stochLen  = input.int(14,  "Stoch Length",  group="StochRSI")
+smoothK   = input.int(3,   "Smooth K",      group="StochRSI")
+smoothD   = input.int(3,   "Smooth D",      group="StochRSI")
+
+adxLen    = input.int(14,  "ADX Length",    group="ADX")
+adxMin    = input.int(20,  "ADX Minimum",   group="ADX")
+
+atrLen    = input.int(14,   "ATR Length",              group="Risk")
+slMult    = input.float(1.1, "SL Multiplier (× ATR)",  step=0.1, group="Risk")
+tp1Mult   = input.float(1.5, "TP1 Multiplier (× ATR)", step=0.1, group="Risk")
+tp2Mult   = input.float(2.5, "TP2 Multiplier (× ATR)", step=0.1, group="Risk")
+
+sqzThresh   = input.float(0.5, "Squeeze Threshold (× ATR)", step=0.1, group="Squeeze")
+sqzLookback = input.int(10,    "Squeeze Lookback Bars",     group="Squeeze")
+
+srLookback = input.int(10, "S/R Pivot Lookback", group="S/R")
+
+volFloor    = input.float(0.3, "Volume Floor (× avg)",    step=0.1, group="Filters")
+
+followThruMult = input.float(0.5, "Follow-Through (× ATR)", step=0.1, group="Reputation")
+cooldownBars   = input.int(4,     "Evaluation Window (bars)",          group="Reputation")
+groundedBars   = input.int(8,     "Grounded Lockout (bars)",           group="Reputation")
+extendedBars   = input.int(16,    "Extended Lockout (bars)",           group="Reputation")
+
+showRepTable   = input.bool(true, "Show Reputation Table", group="Display")
+showInfoTable  = input.bool(true, "Show Info Table",       group="Display")
+showLevels     = input.bool(true, "Plot Signal Levels",    group="Display")
+
+
+// ========================== CORE CALCULATIONS ===============================
+
+ema9  = ta.ema(close, ema9Len)
+ema21 = ta.ema(close, ema21Len)
+ema50 = ta.ema(close, ema50Len)
+vwapValue = ta.vwap(hlc3)
+rsi1    = ta.rsi(close, rsiLen)
+stoch_k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, stochLen), smoothK)
+stoch_d = ta.sma(stoch_k, smoothD)
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+atrValue = ta.atr(atrLen)
+htf_ema21 = request.security(syminfo.tickerid, "60", ta.ema(close, ema21Len), lookahead=barmerge.lookahead_off)
+volAvg   = ta.sma(volume, 20)
+volRatio = volAvg > 0 ? volume / volAvg : 0.0
+
+
+// ========================== S/R DETECTION ===================================
+
+pivHigh = ta.pivothigh(high, srLookback, srLookback)
+pivLow  = ta.pivotlow(low, srLookback, srLookback)
+var float[] srLevels = array.new_float(0)
+if not na(pivHigh)
+    array.push(srLevels, pivHigh)
+    if array.size(srLevels) > 20
+        array.shift(srLevels)
+if not na(pivLow)
+    array.push(srLevels, pivLow)
+    if array.size(srLevels) > 20
+        array.shift(srLevels)
+nearSR   = float(na)
+nearDist = 999999.0
+if array.size(srLevels) > 0
+    for i = 0 to array.size(srLevels) - 1
+        lvl = array.get(srLevels, i)
+        d   = math.abs(close - lvl)
+        if d < nearDist
+            nearDist := d
+            nearSR   := lvl
+
+
+// ========================== SESSION LOGIC ===================================
+
+inSession    = not na(time(timeframe.period, "0930-1545", "America/New_York"))
+isNewSession = inSession and not inSession[1]
+
+// Minutes since 9:30 ET (0 at session open, grows through the day)
+// Used for time-of-day analysis in the Data Lab
+var int sessionMinute = 0
+if isNewSession
+    sessionMinute := 0
+else if inSession
+    sessionMinute := sessionMinute + 15  // 15-min bars
+
+
+// ========================== SIGNAL CONDITIONS ===============================
+
+bullStack = ema9 > ema21 and ema21 > ema50
+bearStack = ema9 < ema21 and ema21 < ema50
+
+vwapBull = close > vwapValue
+vwapBear = close < vwapValue
+
+htfBull = close > htf_ema21
+htfBear = close < htf_ema21
+
+// Squeeze: basic K vs D direction
+stochBull = stoch_k > stoch_d
+stochBear = stoch_k < stoch_d
+
+// Trend: K > D AND K accelerating (v2.1 tightening)
+trendStochBull = stoch_k > stoch_d and stoch_k > stoch_k[1]
+trendStochBear = stoch_k < stoch_d and stoch_k < stoch_k[1]
+
+adxOK = adxValue >= adxMin
+volOK = volRatio >= volFloor
+
+// Trend Continuation
+trendLong  = vwapBull and bullStack and htfBull and trendStochBull and adxOK and volOK
+trendShort = vwapBear and bearStack and htfBear and trendStochBear and adxOK and volOK
+
+// Squeeze Detection
+sqzDetected = false
+for i = 0 to sqzLookback - 1
+    if math.abs(ema9[i] - ema50[i]) < sqzThresh * atrValue[i]
+        sqzDetected := true
+        break
+
+// Squeeze Entry (v2.1: dropped EMA50 gate)
+sqzPriceLong  = close > ema9 and close > ema21
+sqzPriceShort = close < ema9 and close < ema21
+emaCrossUp    = ta.crossover(ema9, ema21)
+emaCrossDown  = ta.crossunder(ema9, ema21)
+
+sqzLong  = sqzDetected and sqzPriceLong  and emaCrossUp   and stochBull and volOK
+sqzShort = sqzDetected and sqzPriceShort and emaCrossDown and stochBear and volOK
+
+
+// ========================== REPUTATION ENGINE ===============================
+
+ELIGIBLE = 0
+GROUNDED = 1
+EXTENDED = 2
+
+type SignalTracker
+    int    repState        = 0
+    int    lockoutEnd      = 0
+    int    consecStops     = 0
+    bool   evalPending     = false
+    float  evalPrice       = na
+    float  evalATR         = na
+    int    evalDir         = 0
+    int    evalBar         = 0
+    float  evalHigh        = na       // NEW v3.0: running high during eval window
+    float  evalLow         = na       // NEW v3.0: running low during eval window
+    bool   ghostPending    = false
+    float  ghostPrice      = na
+    float  ghostATR        = na
+    int    ghostDir        = 0
+    int    ghostBar        = 0
+    float  ghostHigh       = na       // NEW v3.0
+    float  ghostLow        = na       // NEW v3.0
+    float  lastSignalPrice = na
+    float  lastFollowTarget = na
+    int    lastSignalDir   = 0
+
+var SignalTracker trendTrk = SignalTracker.new()
+var SignalTracker sqzTrk   = SignalTracker.new()
+var bool sessionResetDone = false
+
+if not inSession
+    sessionResetDone := false
+if isNewSession and not sessionResetDone
+    trendTrk.repState       := ELIGIBLE
+    trendTrk.lockoutEnd     := 0
+    trendTrk.consecStops    := 0
+    trendTrk.evalPending    := false
+    trendTrk.ghostPending   := false
+    trendTrk.lastSignalPrice  := na
+    trendTrk.lastFollowTarget := na
+    trendTrk.lastSignalDir  := 0
+    sqzTrk.repState         := ELIGIBLE
+    sqzTrk.lockoutEnd       := 0
+    sqzTrk.consecStops      := 0
+    sqzTrk.evalPending      := false
+    sqzTrk.ghostPending     := false
+    sqzTrk.lastSignalPrice   := na
+    sqzTrk.lastFollowTarget  := na
+    sqzTrk.lastSignalDir     := 0
+    sessionResetDone         := true
+
+// Update running high/low during active eval windows (NEW v3.0)
+if trendTrk.evalPending
+    trendTrk.evalHigh := na(trendTrk.evalHigh) ? high : math.max(trendTrk.evalHigh, high)
+    trendTrk.evalLow  := na(trendTrk.evalLow)  ? low  : math.min(trendTrk.evalLow,  low)
+if trendTrk.ghostPending
+    trendTrk.ghostHigh := na(trendTrk.ghostHigh) ? high : math.max(trendTrk.ghostHigh, high)
+    trendTrk.ghostLow  := na(trendTrk.ghostLow)  ? low  : math.min(trendTrk.ghostLow,  low)
+if sqzTrk.evalPending
+    sqzTrk.evalHigh := na(sqzTrk.evalHigh) ? high : math.max(sqzTrk.evalHigh, high)
+    sqzTrk.evalLow  := na(sqzTrk.evalLow)  ? low  : math.min(sqzTrk.evalLow,  low)
+if sqzTrk.ghostPending
+    sqzTrk.ghostHigh := na(sqzTrk.ghostHigh) ? high : math.max(sqzTrk.ghostHigh, high)
+    sqzTrk.ghostLow  := na(sqzTrk.ghostLow)  ? low  : math.min(sqzTrk.ghostLow,  low)
+
+checkFollowThru(int dir, float price, float atr) =>
+    passed = false
+    target = dir == 1 ? price + followThruMult * atr : price - followThruMult * atr
+    for i = 0 to cooldownBars - 1
+        if dir == 1 and high[i] >= target
+            passed := true
+        if dir == 2 and low[i] <= target
+            passed := true
+    passed
+
+calcRR(float entry, float sl, float tp) =>
+    risk = math.abs(entry - sl)
+    reward = math.abs(tp - entry)
+    risk > 0 ? math.round(reward / risk, 2) : 0.0
+
+
+// ========================== WEBHOOK DATA VARIABLES ==========================
+
+float sigDir        = 0.0
+float sigType       = 0.0
+float sigStatus     = 0.0
+float sigSL         = 0.0
+float sigTP1        = 0.0
+float sigTP2        = 0.0
+float sigStopPts    = 0.0
+float sigRR1        = 0.0
+float sigRR2        = 0.0
+float sigStops      = 0.0
+float sigRep        = 0.0
+float sigFT         = 0.0          // ft_target
+float sigResultCode = 0.0
+float sigFTHigh     = 0.0          // NEW v3.0
+float sigFTLow      = 0.0          // NEW v3.0
+float sigFTActual   = 0.0          // NEW v3.0
+float sigMovePts    = 0.0          // NEW v3.0
+float sigStateBefore = 0.0         // NEW v3.0
+float sigStateAfter  = 0.0         // NEW v3.0
+float sigIsGhost    = 0.0          // NEW v3.0
+float sigHtfBull    = 0.0          // NEW v3.0
+
+bool fireTrendAlert = false
+bool fireSqzAlert   = false
+bool trendEntryLong  = false
+bool trendEntryShort = false
+bool sqzEntryLong    = false
+bool sqzEntryShort   = false
+bool trendEvalDone   = false
+bool sqzEvalDone     = false
+
+
+// ========================== PROCESS TREND TRACKER ===========================
+
+// ---- 1. Real eval completion ----
+if trendTrk.evalPending and (bar_index - trendTrk.evalBar >= cooldownBars)
+    ftResult = checkFollowThru(trendTrk.evalDir, trendTrk.evalPrice, trendTrk.evalATR)
+    stateBefore = trendTrk.repState
+    if ftResult
+        trendTrk.consecStops := 0
+    else
+        trendTrk.consecStops += 1
+        if trendTrk.consecStops >= 2
+            trendTrk.repState := EXTENDED
+            trendTrk.lockoutEnd := bar_index + extendedBars
+        else
+            trendTrk.repState := GROUNDED
+            trendTrk.lockoutEnd := bar_index + groundedBars
+
+    ftTarget = trendTrk.evalDir == 1 ? trendTrk.evalPrice + followThruMult * trendTrk.evalATR : trendTrk.evalPrice - followThruMult * trendTrk.evalATR
+    movePts  = trendTrk.evalDir == 1 ? close - trendTrk.evalPrice : trendTrk.evalPrice - close
+
+    sigDir         := trendTrk.evalDir == 1 ? 1.0 : 2.0
+    sigType        := 1.0
+    sigStatus      := 2.0
+    sigStops       := trendTrk.consecStops
+    sigRep         := trendTrk.repState
+    sigFT          := ftTarget
+    sigResultCode  := ftResult ? 1.0 : 2.0
+    sigFTHigh      := nz(trendTrk.evalHigh, high)
+    sigFTLow       := nz(trendTrk.evalLow, low)
+    sigFTActual    := close
+    sigMovePts     := movePts
+    sigStateBefore := stateBefore
+    sigStateAfter  := trendTrk.repState
+    sigIsGhost     := 0.0
+    fireTrendAlert := true
+    trendEvalDone  := true
+    trendTrk.evalPending := false
+    trendTrk.evalHigh := na
+    trendTrk.evalLow  := na
+
+// ---- 2. Ghost eval completion ----
+if trendTrk.ghostPending and (bar_index - trendTrk.ghostBar >= cooldownBars)
+    ghostFT = checkFollowThru(trendTrk.ghostDir, trendTrk.ghostPrice, trendTrk.ghostATR)
+    stateBeforeGhost = trendTrk.repState
+    if ghostFT
+        trendTrk.consecStops := math.max(0, trendTrk.consecStops - 1)
+        if trendTrk.consecStops == 0
+            trendTrk.repState := ELIGIBLE
+            trendTrk.lockoutEnd := 0
+        else
+            trendTrk.repState := GROUNDED
+            trendTrk.lockoutEnd := bar_index + groundedBars
+
+    ghostTarget = trendTrk.ghostDir == 1 ? trendTrk.ghostPrice + followThruMult * trendTrk.ghostATR : trendTrk.ghostPrice - followThruMult * trendTrk.ghostATR
+    ghostMove   = trendTrk.ghostDir == 1 ? close - trendTrk.ghostPrice : trendTrk.ghostPrice - close
+
+    sigDir         := trendTrk.ghostDir == 1 ? 1.0 : 2.0
+    sigType        := 1.0
+    sigStatus      := 2.0
+    sigStops       := trendTrk.consecStops
+    sigRep         := trendTrk.repState
+    sigFT          := ghostTarget
+    sigResultCode  := ghostFT ? 1.0 : 2.0
+    sigFTHigh      := nz(trendTrk.ghostHigh, high)
+    sigFTLow       := nz(trendTrk.ghostLow, low)
+    sigFTActual    := close
+    sigMovePts     := ghostMove
+    sigStateBefore := stateBeforeGhost
+    sigStateAfter  := trendTrk.repState
+    sigIsGhost     := 1.0
+    fireTrendAlert := true
+
+    trendTrk.ghostPending := false
+    trendTrk.ghostHigh := na
+    trendTrk.ghostLow  := na
+
+// ---- 3. Lockout expiry ----
+if trendTrk.repState != ELIGIBLE and bar_index >= trendTrk.lockoutEnd
+    trendTrk.repState := ELIGIBLE
+    trendTrk.consecStops := 0
+
+// ---- 4. Signal detection ----
+trendHasLong  = trendLong  and inSession
+trendHasShort = trendShort and inSession
+
+if trendTrk.repState == ELIGIBLE and not trendTrk.evalPending and not fireTrendAlert
+    if trendHasLong
+        sl  = close - slMult  * atrValue
+        tp1 = close + tp1Mult * atrValue
+        tp2 = close + tp2Mult * atrValue
+        sigDir     := 1.0
+        sigType    := 1.0
+        sigStatus  := 1.0
+        sigSL      := sl
+        sigTP1     := tp1
+        sigTP2     := tp2
+        sigStopPts := slMult * atrValue
+        sigRR1     := calcRR(close, sl, tp1)
+        sigRR2     := calcRR(close, sl, tp2)
+        sigStops   := trendTrk.consecStops
+        sigRep     := 0.0
+        sigHtfBull := htfBull ? 1.0 : 0.0
+        fireTrendAlert  := true
+        trendEntryLong  := true
+
+        trendTrk.evalPending     := true
+        trendTrk.evalPrice       := close
+        trendTrk.evalATR         := atrValue
+        trendTrk.evalDir         := 1
+        trendTrk.evalBar         := bar_index
+        trendTrk.evalHigh        := high
+        trendTrk.evalLow         := low
+        trendTrk.lastSignalPrice  := close
+        trendTrk.lastFollowTarget := close + followThruMult * atrValue
+        trendTrk.lastSignalDir    := 1
+
+    else if trendHasShort
+        sl  = close + slMult  * atrValue
+        tp1 = close - tp1Mult * atrValue
+        tp2 = close - tp2Mult * atrValue
+        sigDir     := 2.0
+        sigType    := 1.0
+        sigStatus  := 1.0
+        sigSL      := sl
+        sigTP1     := tp1
+        sigTP2     := tp2
+        sigStopPts := slMult * atrValue
+        sigRR1     := calcRR(close, sl, tp1)
+        sigRR2     := calcRR(close, sl, tp2)
+        sigStops   := trendTrk.consecStops
+        sigRep     := 0.0
+        sigHtfBull := htfBull ? 1.0 : 0.0
+        fireTrendAlert   := true
+        trendEntryShort  := true
+
+        trendTrk.evalPending     := true
+        trendTrk.evalPrice       := close
+        trendTrk.evalATR         := atrValue
+        trendTrk.evalDir         := 2
+        trendTrk.evalBar         := bar_index
+        trendTrk.evalHigh        := high
+        trendTrk.evalLow         := low
+        trendTrk.lastSignalPrice  := close
+        trendTrk.lastFollowTarget := close - followThruMult * atrValue
+        trendTrk.lastSignalDir    := 2
+
+// ---- 5. Ghost signal detection ----
+if trendTrk.repState != ELIGIBLE and not trendTrk.ghostPending
+    if trendHasLong
+        trendTrk.ghostPending     := true
+        trendTrk.ghostPrice       := close
+        trendTrk.ghostATR         := atrValue
+        trendTrk.ghostDir         := 1
+        trendTrk.ghostBar         := bar_index
+        trendTrk.ghostHigh        := high
+        trendTrk.ghostLow         := low
+        trendTrk.lastSignalPrice  := close
+        trendTrk.lastFollowTarget := close + followThruMult * atrValue
+        trendTrk.lastSignalDir    := 1
+    else if trendHasShort
+        trendTrk.ghostPending     := true
+        trendTrk.ghostPrice       := close
+        trendTrk.ghostATR         := atrValue
+        trendTrk.ghostDir         := 2
+        trendTrk.ghostBar         := bar_index
+        trendTrk.ghostHigh        := high
+        trendTrk.ghostLow         := low
+        trendTrk.lastSignalPrice  := close
+        trendTrk.lastFollowTarget := close - followThruMult * atrValue
+        trendTrk.lastSignalDir    := 2
+
+
+// ========================== PROCESS SQUEEZE TRACKER =========================
+
+// ---- 1. Real eval completion ----
+if sqzTrk.evalPending and (bar_index - sqzTrk.evalBar >= cooldownBars)
+    ftResult = checkFollowThru(sqzTrk.evalDir, sqzTrk.evalPrice, sqzTrk.evalATR)
+    stateBefore = sqzTrk.repState
+    if ftResult
+        sqzTrk.consecStops := 0
+    else
+        sqzTrk.consecStops += 1
+        if sqzTrk.consecStops >= 2
+            sqzTrk.repState := EXTENDED
+            sqzTrk.lockoutEnd := bar_index + extendedBars
+        else
+            sqzTrk.repState := GROUNDED
+            sqzTrk.lockoutEnd := bar_index + groundedBars
+
+    ftTarget = sqzTrk.evalDir == 1 ? sqzTrk.evalPrice + followThruMult * sqzTrk.evalATR : sqzTrk.evalPrice - followThruMult * sqzTrk.evalATR
+    movePts  = sqzTrk.evalDir == 1 ? close - sqzTrk.evalPrice : sqzTrk.evalPrice - close
+
+    sigDir         := sqzTrk.evalDir == 1 ? 1.0 : 2.0
+    sigType        := 2.0
+    sigStatus      := 2.0
+    sigStops       := sqzTrk.consecStops
+    sigRep         := sqzTrk.repState
+    sigFT          := ftTarget
+    sigResultCode  := ftResult ? 1.0 : 2.0
+    sigFTHigh      := nz(sqzTrk.evalHigh, high)
+    sigFTLow       := nz(sqzTrk.evalLow, low)
+    sigFTActual    := close
+    sigMovePts     := movePts
+    sigStateBefore := stateBefore
+    sigStateAfter  := sqzTrk.repState
+    sigIsGhost     := 0.0
+    fireSqzAlert := true
+    sqzEvalDone  := true
+    sqzTrk.evalPending := false
+    sqzTrk.evalHigh := na
+    sqzTrk.evalLow  := na
+
+// ---- 2. Ghost eval completion ----
+if sqzTrk.ghostPending and (bar_index - sqzTrk.ghostBar >= cooldownBars)
+    ghostFT = checkFollowThru(sqzTrk.ghostDir, sqzTrk.ghostPrice, sqzTrk.ghostATR)
+    stateBeforeGhost = sqzTrk.repState
+    if ghostFT
+        sqzTrk.consecStops := math.max(0, sqzTrk.consecStops - 1)
+        if sqzTrk.consecStops == 0
+            sqzTrk.repState := ELIGIBLE
+            sqzTrk.lockoutEnd := 0
+        else
+            sqzTrk.repState := GROUNDED
+            sqzTrk.lockoutEnd := bar_index + groundedBars
+
+    ghostTarget = sqzTrk.ghostDir == 1 ? sqzTrk.ghostPrice + followThruMult * sqzTrk.ghostATR : sqzTrk.ghostPrice - followThruMult * sqzTrk.ghostATR
+    ghostMove   = sqzTrk.ghostDir == 1 ? close - sqzTrk.ghostPrice : sqzTrk.ghostPrice - close
+
+    sigDir         := sqzTrk.ghostDir == 1 ? 1.0 : 2.0
+    sigType        := 2.0
+    sigStatus      := 2.0
+    sigStops       := sqzTrk.consecStops
+    sigRep         := sqzTrk.repState
+    sigFT          := ghostTarget
+    sigResultCode  := ghostFT ? 1.0 : 2.0
+    sigFTHigh      := nz(sqzTrk.ghostHigh, high)
+    sigFTLow       := nz(sqzTrk.ghostLow, low)
+    sigFTActual    := close
+    sigMovePts     := ghostMove
+    sigStateBefore := stateBeforeGhost
+    sigStateAfter  := sqzTrk.repState
+    sigIsGhost     := 1.0
+    fireSqzAlert := true
+
+    sqzTrk.ghostPending := false
+    sqzTrk.ghostHigh := na
+    sqzTrk.ghostLow  := na
+
+// ---- 3. Lockout expiry ----
+if sqzTrk.repState != ELIGIBLE and bar_index >= sqzTrk.lockoutEnd
+    sqzTrk.repState := ELIGIBLE
+    sqzTrk.consecStops := 0
+
+// ---- 4. Signal detection ----
+sqzHasLong  = sqzLong  and inSession
+sqzHasShort = sqzShort and inSession
+
+if sqzTrk.repState == ELIGIBLE and not sqzTrk.evalPending and not fireSqzAlert
+    if sqzHasLong
+        sl  = close - slMult  * atrValue
+        tp1 = close + tp1Mult * atrValue
+        tp2 = close + tp2Mult * atrValue
+        sigDir     := 1.0
+        sigType    := 2.0
+        sigStatus  := 1.0
+        sigSL      := sl
+        sigTP1     := tp1
+        sigTP2     := tp2
+        sigStopPts := slMult * atrValue
+        sigRR1     := calcRR(close, sl, tp1)
+        sigRR2     := calcRR(close, sl, tp2)
+        sigStops   := sqzTrk.consecStops
+        sigRep     := 0.0
+        sigHtfBull := htfBull ? 1.0 : 0.0
+        fireSqzAlert := true
+        sqzEntryLong := true
+
+        sqzTrk.evalPending     := true
+        sqzTrk.evalPrice       := close
+        sqzTrk.evalATR         := atrValue
+        sqzTrk.evalDir         := 1
+        sqzTrk.evalBar         := bar_index
+        sqzTrk.evalHigh        := high
+        sqzTrk.evalLow         := low
+        sqzTrk.lastSignalPrice  := close
+        sqzTrk.lastFollowTarget := close + followThruMult * atrValue
+        sqzTrk.lastSignalDir    := 1
+
+    else if sqzHasShort
+        sl  = close + slMult  * atrValue
+        tp1 = close - tp1Mult * atrValue
+        tp2 = close - tp2Mult * atrValue
+        sigDir     := 2.0
+        sigType    := 2.0
+        sigStatus  := 1.0
+        sigSL      := sl
+        sigTP1     := tp1
+        sigTP2     := tp2
+        sigStopPts := slMult * atrValue
+        sigRR1     := calcRR(close, sl, tp1)
+        sigRR2     := calcRR(close, sl, tp2)
+        sigStops   := sqzTrk.consecStops
+        sigRep     := 0.0
+        sigHtfBull := htfBull ? 1.0 : 0.0
+        fireSqzAlert  := true
+        sqzEntryShort := true
+
+        sqzTrk.evalPending     := true
+        sqzTrk.evalPrice       := close
+        sqzTrk.evalATR         := atrValue
+        sqzTrk.evalDir         := 2
+        sqzTrk.evalBar         := bar_index
+        sqzTrk.evalHigh        := high
+        sqzTrk.evalLow         := low
+        sqzTrk.lastSignalPrice  := close
+        sqzTrk.lastFollowTarget := close - followThruMult * atrValue
+        sqzTrk.lastSignalDir    := 2
+
+// ---- 5. Ghost signal detection ----
+if sqzTrk.repState != ELIGIBLE and not sqzTrk.ghostPending
+    if sqzHasLong
+        sqzTrk.ghostPending     := true
+        sqzTrk.ghostPrice       := close
+        sqzTrk.ghostATR         := atrValue
+        sqzTrk.ghostDir         := 1
+        sqzTrk.ghostBar         := bar_index
+        sqzTrk.ghostHigh        := high
+        sqzTrk.ghostLow         := low
+        sqzTrk.lastSignalPrice  := close
+        sqzTrk.lastFollowTarget := close + followThruMult * atrValue
+        sqzTrk.lastSignalDir    := 1
+    else if sqzHasShort
+        sqzTrk.ghostPending     := true
+        sqzTrk.ghostPrice       := close
+        sqzTrk.ghostATR         := atrValue
+        sqzTrk.ghostDir         := 2
+        sqzTrk.ghostBar         := bar_index
+        sqzTrk.ghostHigh        := high
+        sqzTrk.ghostLow         := low
+        sqzTrk.lastSignalPrice  := close
+        sqzTrk.lastFollowTarget := close - followThruMult * atrValue
+        sqzTrk.lastSignalDir    := 2
+
+
+// ========================== HIDDEN DATA PLOTS ===============================
+// Plot indices below are used by the alert template via {{plot_N}} references.
+// TradingView's {{plot("name")}} syntax only works for the first ~20 plots,
+// so we use numeric indices for forward safety. Indices are 0-based.
+//
+//  0 sig_dir           11 sig_rep           22 stoch_d_val
+//  1 sig_type          12 sig_ft            23 htf_bull_val
+//  2 sig_status        13 sig_result        24 session_minute_val
+//  3 sig_sl            14 atr_val           25 sig_ft_high
+//  4 sig_tp1           15 vwap_val          26 sig_ft_low
+//  5 sig_tp2           16 ema9_val          27 sig_ft_actual
+//  6 sig_stop_pts      17 ema21_val         28 sig_move_pts
+//  7 sig_rr1           18 ema50_val         29 sig_state_before
+//  8 sig_rr2           19 adx_val           30 sig_state_after
+//  9 sig_stops         20 stochk_val        31 sig_is_ghost
+// 10 sig_ft (target)   21 nearsr_val        32 volratio_val
+//                                           33 sig_htf_bull (legacy)
+// ============================================================================
+
+plot(nz(sigDir, 0),        "sig_dir",         display=display.none)     // 0
+plot(nz(sigType, 0),       "sig_type",        display=display.none)     // 1
+plot(nz(sigStatus, 0),     "sig_status",      display=display.none)     // 2
+plot(nz(sigSL, 0),         "sig_sl",          display=display.none)     // 3
+plot(nz(sigTP1, 0),        "sig_tp1",         display=display.none)     // 4
+plot(nz(sigTP2, 0),        "sig_tp2",         display=display.none)     // 5
+plot(nz(sigStopPts, 0),    "sig_stop_pts",    display=display.none)     // 6
+plot(nz(sigRR1, 0),        "sig_rr1",         display=display.none)     // 7
+plot(nz(sigRR2, 0),        "sig_rr2",         display=display.none)     // 8
+plot(nz(sigStops, 0),      "sig_stops",       display=display.none)     // 9
+plot(nz(sigFT, 0),         "sig_ft",          display=display.none)     // 10
+plot(nz(sigRep, 0),        "sig_rep",         display=display.none)     // 11
+plot(nz(sigResultCode, 0), "sig_result",      display=display.none)     // 12
+plot(nz(atrValue, 0),      "atr_val",         display=display.none)     // 13
+plot(nz(vwapValue, 0),     "vwap_val",        display=display.none)     // 14
+plot(nz(ema9, 0),          "ema9_val",        display=display.none)     // 15
+plot(nz(ema21, 0),         "ema21_val",       display=display.none)     // 16
+plot(nz(ema50, 0),         "ema50_val",       display=display.none)     // 17
+plot(nz(adxValue, 0),      "adx_val",         display=display.none)     // 18
+plot(nz(stoch_k, 0),       "stochk_val",      display=display.none)     // 19
+plot(nz(stoch_d, 0),       "stochd_val",      display=display.none)     // 20
+plot(nz(nearSR, 0),        "nearsr_val",      display=display.none)     // 21
+plot(nz(volRatio, 0),      "volratio_val",    display=display.none)     // 22
+plot(nz(sigHtfBull, 0),    "htf_bull_val",    display=display.none)     // 23
+plot(sessionMinute,        "session_min",     display=display.none)     // 24
+plot(nz(sigFTHigh, 0),     "sig_ft_high",     display=display.none)     // 25
+plot(nz(sigFTLow, 0),      "sig_ft_low",      display=display.none)     // 26
+plot(nz(sigFTActual, 0),   "sig_ft_actual",   display=display.none)     // 27
+plot(nz(sigMovePts, 0),    "sig_move_pts",    display=display.none)     // 28
+plot(nz(sigStateBefore, 0),"sig_state_before",display=display.none)     // 29
+plot(nz(sigStateAfter, 0), "sig_state_after", display=display.none)     // 30
+plot(nz(sigIsGhost, 0),    "sig_is_ghost",    display=display.none)     // 31
+
+
+// ========================== ALERT CONDITION =================================
+
+anySignalFired = fireTrendAlert or fireSqzAlert
+
+alertcondition(anySignalFired, title="MNQ Signal", message='{"sig_dir":{{plot_0}},"sig_type":{{plot_1}},"sig_status":{{plot_2}},"entry_price":{{close}},"price":{{close}},"sl":{{plot_3}},"tp1":{{plot_4}},"tp2":{{plot_5}},"stop_pts":{{plot_6}},"rr1":{{plot_7}},"rr2":{{plot_8}},"consecutive_stops":{{plot_9}},"ft_target":{{plot_10}},"sig_rep":{{plot_11}},"sig_result":{{plot_12}},"atr":{{plot_13}},"vwap":{{plot_14}},"ema9":{{plot_15}},"ema21":{{plot_16}},"ema50":{{plot_17}},"adx":{{plot_18}},"stoch_k":{{plot_19}},"stoch_d":{{plot_20}},"near_sr":{{plot_21}},"volume_ratio":{{plot_22}},"htf_bull":{{plot_23}},"session_minute":{{plot_24}},"ft_high":{{plot_25}},"ft_low":{{plot_26}},"ft_actual_price":{{plot_27}},"move_points":{{plot_28}},"state_before":{{plot_29}},"state_after":{{plot_30}},"is_ghost":{{plot_31}},"ticker":"MNQ","version":"3.0"}')
+
+
+// ========================== CHART PLOTTING ==================================
+
+plot(ema9,  "EMA 9",  color=color.new(#00BFFF, 0), linewidth=1)
+plot(ema21, "EMA 21", color=color.new(#FF9500, 0), linewidth=1)
+plot(ema50, "EMA 50", color=color.new(#9B59B6, 0), linewidth=2)
+plot(vwapValue, "VWAP", color=color.new(#888888, 100), linewidth=1, display=display.none)
+plot(htf_ema21, "1H EMA21", color=color.new(#ff00ff, 100), linewidth=1, display=display.none)
+
+trendFTactive = (trendTrk.evalPending or trendTrk.ghostPending) and showLevels
+sqzFTactive   = (sqzTrk.evalPending or sqzTrk.ghostPending) and showLevels
+plot(trendFTactive ? trendTrk.lastFollowTarget : na, "Trend FT Target", color=color.new(color.white, 40), linewidth=1, style=plot.style_linebr)
+plot(sqzFTactive ? sqzTrk.lastFollowTarget : na, "Sqz FT Target", color=color.new(color.white, 40), linewidth=1, style=plot.style_linebr)
+
+plotshape(trendEntryLong,  "Trend Long",  style=shape.triangleup,   location=location.belowbar, color=color.new(#00d4aa, 0), size=size.small)
+plotshape(trendEntryShort, "Trend Short", style=shape.triangledown, location=location.abovebar, color=color.new(#ff6b6b, 0), size=size.small)
+plotshape(sqzEntryLong,    "Sqz Long",    style=shape.diamond,      location=location.belowbar, color=color.new(#00d4aa, 0), size=size.small)
+plotshape(sqzEntryShort,   "Sqz Short",   style=shape.diamond,      location=location.abovebar, color=color.new(#ff6b6b, 0), size=size.small)
+plotshape(trendEvalDone,   "Trend Eval",  style=shape.circle, location=location.abovebar, color=color.new(color.orange, 60), size=size.tiny)
+plotshape(sqzEvalDone,     "Sqz Eval",    style=shape.circle, location=location.belowbar, color=color.new(color.orange, 60), size=size.tiny)
+
+
+// ========================== REPUTATION TABLE ================================
+
+if showRepTable
+    var table repTbl = table.new(position.top_right, 3, 7, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=color.new(#333333, 0))
+    trendRepStr = trendTrk.repState == ELIGIBLE ? "ELIGIBLE" : trendTrk.repState == GROUNDED ? "GROUNDED" : "EXTENDED"
+    sqzRepStr   = sqzTrk.repState == ELIGIBLE   ? "ELIGIBLE" : sqzTrk.repState == GROUNDED   ? "GROUNDED" : "EXTENDED"
+    trendRepClr = trendTrk.repState == ELIGIBLE ? color.green : trendTrk.repState == GROUNDED ? color.orange : color.red
+    sqzRepClr   = sqzTrk.repState == ELIGIBLE   ? color.green : sqzTrk.repState == GROUNDED   ? color.orange : color.red
+    table.cell(repTbl, 0, 0, "",        bgcolor=color.new(#2a2a4e, 0), text_color=color.gray,  text_size=size.small)
+    table.cell(repTbl, 1, 0, "TREND",   bgcolor=color.new(#2a2a4e, 0), text_color=color.white, text_size=size.small)
+    table.cell(repTbl, 2, 0, "SQUEEZE", bgcolor=color.new(#2a2a4e, 0), text_color=color.white, text_size=size.small)
+    table.cell(repTbl, 0, 1, "STATE",   text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 1, trendRepStr, text_color=trendRepClr, text_size=size.small)
+    table.cell(repTbl, 2, 1, sqzRepStr,   text_color=sqzRepClr,   text_size=size.small)
+    table.cell(repTbl, 0, 2, "STOPS",   text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 2, str.tostring(trendTrk.consecStops), text_color=trendTrk.consecStops > 0 ? color.red : color.green, text_size=size.small)
+    table.cell(repTbl, 2, 2, str.tostring(sqzTrk.consecStops),   text_color=sqzTrk.consecStops > 0   ? color.red : color.green, text_size=size.small)
+    trendLockBars = trendTrk.repState != ELIGIBLE ? math.max(0, trendTrk.lockoutEnd - bar_index) : 0
+    sqzLockBars   = sqzTrk.repState != ELIGIBLE   ? math.max(0, sqzTrk.lockoutEnd - bar_index)   : 0
+    table.cell(repTbl, 0, 3, "LOCKOUT", text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 3, trendLockBars > 0 ? str.tostring(trendLockBars) + " bars" : "—", text_color=trendLockBars > 0 ? color.orange : color.gray, text_size=size.small)
+    table.cell(repTbl, 2, 3, sqzLockBars > 0   ? str.tostring(sqzLockBars)   + " bars" : "—", text_color=sqzLockBars > 0   ? color.orange : color.gray, text_size=size.small)
+    trendEvalStr = trendTrk.evalPending ? "EVAL " + str.tostring(bar_index - trendTrk.evalBar) + "/4" : trendTrk.ghostPending ? "GHOST " + str.tostring(bar_index - trendTrk.ghostBar) + "/4" : "—"
+    sqzEvalStr   = sqzTrk.evalPending   ? "EVAL " + str.tostring(bar_index - sqzTrk.evalBar)   + "/4" : sqzTrk.ghostPending   ? "GHOST " + str.tostring(bar_index - sqzTrk.ghostBar)   + "/4" : "—"
+    trendEvalClr = trendTrk.evalPending ? color.white : trendTrk.ghostPending ? color.yellow : color.gray
+    sqzEvalClr   = sqzTrk.evalPending   ? color.white : sqzTrk.ghostPending   ? color.yellow : color.gray
+    table.cell(repTbl, 0, 4, "EVAL",    text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 4, trendEvalStr, text_color=trendEvalClr, text_size=size.small)
+    table.cell(repTbl, 2, 4, sqzEvalStr,   text_color=sqzEvalClr,   text_size=size.small)
+    trendFTstr = not na(trendTrk.lastFollowTarget) and (trendTrk.evalPending or trendTrk.ghostPending) ? str.tostring(trendTrk.lastFollowTarget, "#.##") : "—"
+    sqzFTstr   = not na(sqzTrk.lastFollowTarget) and (sqzTrk.evalPending or sqzTrk.ghostPending) ? str.tostring(sqzTrk.lastFollowTarget, "#.##") : "—"
+    table.cell(repTbl, 0, 5, "FT TGT",  text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 5, trendFTstr, text_color=color.white, text_size=size.small)
+    table.cell(repTbl, 2, 5, sqzFTstr,   text_color=color.white, text_size=size.small)
+    sessStr = inSession ? "ACTIVE" : "CLOSED"
+    sessClr = inSession ? color.green : color.gray
+    table.cell(repTbl, 0, 6, "SESSION", text_color=color.gray, text_size=size.small)
+    table.cell(repTbl, 1, 6, sessStr,   text_color=sessClr,   text_size=size.small)
+    table.cell(repTbl, 2, 6, "",        text_color=color.gray, text_size=size.small)
+
+
+// ========================== INFO TABLE ======================================
+
+if showInfoTable
+    var table infoTbl = table.new(position.bottom_right, 2, 9, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=color.new(#333333, 0))
+    table.cell(infoTbl, 0, 0, "FILTER", bgcolor=color.new(#2a2a4e, 0), text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 0, "VALUE",  bgcolor=color.new(#2a2a4e, 0), text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 0, 1, "ADX",       text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 1, str.tostring(adxValue, "#.#"), text_color=adxOK ? color.green : color.red, text_size=size.small)
+    table.cell(infoTbl, 0, 2, "ATR",       text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 2, str.tostring(atrValue, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(infoTbl, 0, 3, "StochK",    text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 3, str.tostring(stoch_k, "#.#"), text_color=stochBull ? color.green : color.red, text_size=size.small)
+    table.cell(infoTbl, 0, 4, "Vol Ratio", text_color=color.gray, text_size=size.small)
+    volClr = volRatio >= 1.0 ? color.green : volRatio >= volFloor ? color.gray : color.red
+    table.cell(infoTbl, 1, 4, str.tostring(volRatio, "#.##") + "x", text_color=volClr, text_size=size.small)
+    table.cell(infoTbl, 0, 5, "VWAP",      text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 5, vwapBull ? "ABOVE" : "BELOW", text_color=vwapBull ? color.green : color.red, text_size=size.small)
+    table.cell(infoTbl, 0, 6, "Stack",     text_color=color.gray, text_size=size.small)
+    stackStr = bullStack ? "BULL" : bearStack ? "BEAR" : "MIXED"
+    stackClr = bullStack ? color.green : bearStack ? color.red : color.gray
+    table.cell(infoTbl, 1, 6, stackStr, text_color=stackClr, text_size=size.small)
+    table.cell(infoTbl, 0, 7, "HTF",       text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 7, htfBull ? "BULL" : "BEAR", text_color=htfBull ? color.green : color.red, text_size=size.small)
+    table.cell(infoTbl, 0, 8, "SQZ",       text_color=color.gray, text_size=size.small)
+    table.cell(infoTbl, 1, 8, sqzDetected ? "ACTIVE" : "—", text_color=sqzDetected ? color.orange : color.gray, text_size=size.small)
