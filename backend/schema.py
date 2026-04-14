@@ -129,6 +129,34 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # ---- Legacy v2.x tables — tolerance mode coexistence (§10.3 Step 1) ----
+    # Kept alongside v3 tables so the backend can handle v2.1.1 Pine payloads
+    # during the migration window. Shape is minimal — we only need enough
+    # columns for the tolerance dispatcher's writes to succeed.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            signal_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT NOT NULL,
+            signal        TEXT NOT NULL,
+            signal_type   TEXT NOT NULL,
+            entry_price   REAL,
+            sl            REAL,
+            tp1           REAL,
+            tp2           REAL,
+            payload_json  TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS eval_results (
+            eval_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT NOT NULL,
+            signal        TEXT,
+            signal_type   TEXT,
+            result        TEXT NOT NULL,
+            payload_json  TEXT
+        )
+    """)
+
     # ---- positions (new in v3.0 Option C, §4.5) ----
     c.execute("""
         CREATE TABLE IF NOT EXISTS positions (
