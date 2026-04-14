@@ -89,6 +89,7 @@ class PositionState:
     post_tp1_mae_points: float = 0.0
     last_heartbeat_bar_ms: int = 0
     heartbeats_processed: int = 0
+    last_observed_close: float = 0.0
     closed_at_ms: Optional[int] = None
     exit_reason: Optional[str] = None
     final_pnl_points: Optional[float] = None
@@ -120,6 +121,7 @@ def new_position(*, signal_id, direction, signal_type, entry_price, sl,
         state=PositionFSMState.OPEN,
         effective_sl=sl,
         last_heartbeat_bar_ms=opened_at_ms,
+        last_observed_close=entry_price,
         **extra,
     )
 
@@ -274,6 +276,7 @@ def step(position: PositionState, bar: Bar, *, eod_cutoff_ms: int) -> StepResult
         post_tp1_mae_points=new_post_tp1_mae,
         last_heartbeat_bar_ms=bar.bar_close_ms,
         heartbeats_processed=position.heartbeats_processed + 1,
+        last_observed_close=bar.close,
     )
 
     # EOD wins over all level checks (§5.8, TC11)
