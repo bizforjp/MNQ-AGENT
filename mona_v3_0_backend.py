@@ -40,6 +40,21 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 import aiohttp
 
+# ---- Option C backend modules (§2.2, §4, §5, §8) ----
+from backend.schema import (
+    init_db as schema_init_db,
+    migrate_add_bar_close_ms_to_signals_v3,
+    BAR_INTERVAL_MS,
+)
+from backend.webhook_router import (
+    route_entry, route_eval, route_heartbeat_for_position,
+)
+from backend.rehydrate import (
+    rehydrate_positions, eod_sweep, eod_cutoff_for_session_of,
+)
+from backend.position_resolver import Bar, PositionFSMState, Transition
+from backend.finnhub_adapter import FinnhubAdapter, FinnhubError
+
 # =============================================================
 # CONFIG
 # =============================================================
@@ -151,7 +166,7 @@ def translate_payload(data: dict) -> dict:
 
     dir_map    = {1: "LONG",    2: "SHORT"}
     type_map   = {1: "TREND",   2: "SQUEEZE"}
-    status_map = {1: "ENTRY",   2: "EVAL_RESULT", 3: "TRADE_OUTCOME"}
+    status_map = {1: "ENTRY",   2: "EVAL_RESULT", 3: "HEARTBEAT"}
     rep_map    = {0: "ELIGIBLE", 1: "GROUNDED",   2: "EXTENDED"}
     result_map = {1: "PASS",    2: "FAIL"}
     exit_map   = {1: "SL_FULL", 2: "TP1_BE", 3: "TP1_TP2", 4: "EOD_TIMEOUT"}
@@ -209,126 +224,20 @@ def _normalize_numeric_fields(data: dict) -> dict:
 
 def init_db():
     """
-    Initialize SQLite database with v3.0 three-table schema.
+    Initialize SQLite with the Option C schema (§4).
 
-    Strategy: suffix approach for rollback safety.
-      - signals_v3     → new table, all v3.0 entries go here
-      - evaluations    → new table, all v3.0 evals go here
-      - trade_outcomes → new table, populated by TP/SL Monitor
-
-    Old v2.x tables (signals, eval_results) are left UNTOUCHED.
-    If v3.0 ever needs to be rolled back, reverting the code restores
-    v2.1.1 behavior with zero SQL gymnastics — the old tables are still
-    there waiting.
-
-    After 1-2 weeks of confirmed stable v3.0 operation, a cleanup
-    migration can rename signals_v3 → signals and drop the old ones.
+    Delegates table/index creation to `backend.schema.init_db`. That module
+    owns the authoritative shape for signals_v3, evaluations, trade_outcomes,
+    positions, and the legacy v2 coexistence tables. Runs the additive
+    `bar_close_ms` migration for DBs that predate the column.
     """
     os.makedirs(DB_DIR, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-
-        # WAL mode for durability + concurrent reads
-        c.execute('PRAGMA journal_mode=WAL')
-        c.execute('PRAGMA synchronous=NORMAL')
-
-        # ---- Table 1: signals_v3 (the Mona's opinion) ----
-        c.execute('''CREATE TABLE IF NOT EXISTS signals_v3 (
-            signal_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp          TEXT NOT NULL,
-            signal             TEXT NOT NULL,
-            signal_type        TEXT NOT NULL,
-
-            entry_price        REAL NOT NULL,
-            sl                 REAL NOT NULL,
-            tp1                REAL NOT NULL,
-            tp2                REAL NOT NULL,
-            stop_pts           REAL NOT NULL,
-            rr1                REAL,
-            rr2                REAL,
-
-            atr                REAL,
-            vwap               REAL,
-            ema9               REAL,
-            ema21              REAL,
-            ema50              REAL,
-            adx                REAL,
-            stoch_k            REAL,
-            stoch_d            REAL,
-            htf_bull           INTEGER,
-            near_sr            REAL,
-            volume_ratio       REAL,
-
-            session_minute     INTEGER,
-            reputation         TEXT,
-            consecutive_stops  INTEGER,
-            conditions         TEXT
-        )''')
-
-        # ---- Table 2: evaluations (the Reputation Engine's grade) ----
-        c.execute('''CREATE TABLE IF NOT EXISTS evaluations (
-            eval_id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id          INTEGER NOT NULL,
-            timestamp          TEXT NOT NULL,
-
-            ft_target          REAL NOT NULL,
-            ft_high            REAL,
-            ft_low             REAL,
-            ft_actual_price    REAL,
-            move_points        REAL,
-            result             TEXT NOT NULL,
-
-            state_before       TEXT NOT NULL,
-            state_after        TEXT NOT NULL,
-            stops_after        INTEGER NOT NULL,
-            lockout_bars       INTEGER,
-
-            is_ghost           INTEGER NOT NULL,
-
-            FOREIGN KEY (signal_id) REFERENCES signals_v3(signal_id)
-        )''')
-
-        # ---- Table 3: trade_outcomes (hypothetical execution results) ----
-        c.execute('''CREATE TABLE IF NOT EXISTS trade_outcomes (
-            outcome_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id           INTEGER NOT NULL,
-            timestamp_opened    TEXT NOT NULL,
-            timestamp_closed    TEXT NOT NULL,
-
-            tp1_hit             INTEGER NOT NULL,
-            tp1_hit_time        TEXT,
-            tp2_hit             INTEGER NOT NULL,
-            tp2_hit_time        TEXT,
-            sl_hit              INTEGER NOT NULL,
-            sl_hit_time         TEXT,
-            be_stop_hit         INTEGER NOT NULL,
-            be_stop_hit_time    TEXT,
-
-            exit_reason         TEXT NOT NULL,
-            final_pnl_points    REAL NOT NULL,
-
-            mae_points          REAL,
-            mfe_points          REAL,
-            mae_time_min        INTEGER,
-            mfe_time_min        INTEGER,
-            post_tp1_mae_points REAL,
-            time_in_trade_min   INTEGER,
-
-            -- v3.1 provision: reserved for ghost position tracking.
-            -- Default 0 in v3.0. Monitor v1 writes only real positions.
-            -- v3.1 Monitor will write 1 for ghost positions (no migration needed).
-            is_ghost            INTEGER NOT NULL DEFAULT 0,
-
-            FOREIGN KEY (signal_id) REFERENCES signals_v3(signal_id)
-        )''')
-
-        # ---- Indexes for query performance ----
-        c.execute('CREATE INDEX IF NOT EXISTS idx_eval_signal ON evaluations(signal_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_outcome_signal ON trade_outcomes(signal_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_signal_timestamp ON signals_v3(timestamp)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_eval_timestamp ON evaluations(timestamp)')
-
-        conn.commit()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        schema_init_db(conn)
+        migrate_add_bar_close_ms_to_signals_v3(conn)
 
 
 def get_parent_signal(signal_id: int) -> dict:
@@ -347,23 +256,45 @@ def get_parent_signal(signal_id: int) -> dict:
         return None
 
 
-def find_parent_by_lookback(signal_type: str, direction: str) -> int:
-    """
-    Lookback Matcher: find the most recent ENTRY in signals_v3 matching
-    signal_type + direction within a 2-hour window. Returns signal_id or None.
-    """
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute('''
-                SELECT signal_id FROM signals_v3
-                WHERE signal_type = ? AND signal = ?
-                  AND timestamp >= strftime('%Y-%m-%d %H:%M:%S', 'now', '-2 hours')
-                ORDER BY signal_id DESC LIMIT 1
-            ''', (signal_type, direction)).fetchone()
-            return row[0] if row else None
-    except Exception as e:
-        print(f"find_parent_by_lookback error: {e}")
-        return None
+# =============================================================
+# OPTION C IN-MEMORY STATE
+# =============================================================
+#
+# _fsm_map is the authoritative in-memory active-position map (§5.2).
+# Keyed by signal_id; each value is a PositionState. Rehydrated on
+# startup from the `positions` table (§4.9 / §8.4).
+#
+# _captured_outcomes is the in-process sink for terminal resolver
+# transitions. post_embed threads it through route_heartbeat_for_position
+# so TP2/SL/BE/EOD closes produce user-visible OUTCOME embeds. In dry-run
+# a driver can read from _captured_outcomes; in production the sink
+# triggers the async Discord post.
+
+_fsm_map: dict = {}
+_captured_outcomes: list = []
+_finnhub = None
+
+
+def _get_finnhub():
+    """Lazy adapter. Falls back to a stub that always raises FinnhubError
+    so gap recovery takes the GAP_CLEAN branch when no key is configured."""
+    global _finnhub
+    if _finnhub is not None:
+        return _finnhub
+    api_key = os.getenv("FINNHUB_API_KEY", "")
+    if api_key:
+        _finnhub = FinnhubAdapter(api_key=api_key)
+    else:
+        class _NoFinnhub:
+            def fetch_bars(self, **kw):
+                raise FinnhubError("FINNHUB_API_KEY not configured")
+        _finnhub = _NoFinnhub()
+    return _finnhub
+
+
+def _outcome_sink(payload: dict) -> None:
+    """post_embed callback — captures terminal transitions for Discord."""
+    _captured_outcomes.append(payload)
 
 
 # =============================================================
@@ -803,87 +734,73 @@ async def receive_webhook(request: Request, token: str = ""):
     parent = None
     is_ghost = False
     table_written = None
+    resolver_closures: list = []
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
+            conn.execute("PRAGMA foreign_keys = ON")
 
-            # ============ ROUTE 1: ENTRY → signals_v3 ============
+            # ============ ROUTE 1: ENTRY (Option C §3.2) ============
             if status == "ENTRY":
-                c.execute('''INSERT INTO signals_v3
-                    (timestamp, signal, signal_type,
-                     entry_price, sl, tp1, tp2, stop_pts, rr1, rr2,
-                     atr, vwap, ema9, ema21, ema50, adx, stoch_k, stoch_d,
-                     htf_bull, near_sr, volume_ratio,
-                     session_minute, reputation, consecutive_stops, conditions)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (timestamp, direction, signal_type,
-                     safe_float(data.get("entry_price", data.get("price"))),
-                     safe_float(data.get("sl")),
-                     safe_float(data.get("tp1")),
-                     safe_float(data.get("tp2")),
-                     safe_float(data.get("stop_pts")),
-                     safe_float(data.get("rr1")),
-                     safe_float(data.get("rr2")),
-                     safe_float(data.get("atr")),
-                     safe_float(data.get("vwap")),
-                     safe_float(data.get("ema9")),
-                     safe_float(data.get("ema21")),
-                     safe_float(data.get("ema50")),
-                     safe_float(data.get("adx")),
-                     safe_float(data.get("stoch_k")),
-                     safe_float(data.get("stoch_d")),
-                     safe_int(data.get("htf_bull")),
-                     safe_float(data.get("near_sr")),
-                     safe_float(data.get("volume_ratio")),
-                     safe_int(data.get("session_minute")),
-                     data.get("reputation", "ELIGIBLE"),
-                     safe_int(data.get("consecutive_stops")),
-                     data.get("conditions", "")))
-                signal_id = c.lastrowid
-                conn.commit()
-                table_written = "signals_v3"
-                embed = build_entry_embed(data, signal_id)
+                signal_id = route_entry(
+                    data, fsm_map=_fsm_map, conn=conn, log=None,
+                )
+                if signal_id is not None:
+                    # v3 path: backfill the rich metadata columns that the
+                    # minimal router INSERT left null. Discord embed relies
+                    # on the incoming payload directly so this UPDATE is
+                    # for Data Lab / future analytics, not this request.
+                    conn.execute(
+                        '''UPDATE signals_v3 SET
+                            rr1=?, rr2=?, atr=?, vwap=?,
+                            ema9=?, ema21=?, ema50=?, adx=?,
+                            stoch_k=?, stoch_d=?, htf_bull=?,
+                            near_sr=?, volume_ratio=?, session_minute=?,
+                            reputation=?, consecutive_stops=?, conditions=?
+                           WHERE signal_id=?''',
+                        (safe_float(data.get("rr1")),
+                         safe_float(data.get("rr2")),
+                         safe_float(data.get("atr")),
+                         safe_float(data.get("vwap")),
+                         safe_float(data.get("ema9")),
+                         safe_float(data.get("ema21")),
+                         safe_float(data.get("ema50")),
+                         safe_float(data.get("adx")),
+                         safe_float(data.get("stoch_k")),
+                         safe_float(data.get("stoch_d")),
+                         safe_int(data.get("htf_bull")),
+                         safe_float(data.get("near_sr")),
+                         safe_float(data.get("volume_ratio")),
+                         safe_int(data.get("session_minute")),
+                         data.get("reputation", "ELIGIBLE"),
+                         safe_int(data.get("consecutive_stops")),
+                         data.get("conditions", ""),
+                         signal_id),
+                    )
+                    conn.commit()
+                    table_written = "signals_v3+positions"
+                else:
+                    # Legacy v2 payload written to `signals` by the tolerance
+                    # dispatcher. No positions row, no entry embed for dry-run.
+                    table_written = "signals"
+                embed = build_entry_embed(data, signal_id or 0)
                 target_channel = CHANNELS.get("alerts")
 
-            # ============ ROUTE 2: EVAL_RESULT → evaluations ============
+            # ============ ROUTE 2: EVAL (Option C §3.3) ============
             elif status == "EVAL_RESULT":
                 is_ghost = safe_int(data.get("is_ghost")) == 1
+                signal_id = route_eval(data, conn=conn, log=None)
+                table_written = "evaluations" if signal_id else None
 
-                # Find parent via Lookback Matcher
-                signal_id = find_parent_by_lookback(signal_type, direction)
-
-                # Orphan rejection: no parent = no write, distinct error line
-                if not signal_id:
+                if signal_id is None:
                     await log_error(
                         "ORPHAN",
-                        f"EVAL {signal_type} {direction} rejected — no parent in last 2h",
-                        raw_snippet=raw_message
+                        f"EVAL {signal_type} {direction} rejected — exact-match "
+                        "lookup on parent_bar_close_ms returned no row",
+                        raw_snippet=raw_message,
                     )
                     return {"status": "rejected", "reason": "no_parent"}
 
-                # Write to evaluations table
-                c.execute('''INSERT INTO evaluations
-                    (signal_id, timestamp,
-                     ft_target, ft_high, ft_low, ft_actual_price, move_points,
-                     result, state_before, state_after, stops_after, lockout_bars, is_ghost)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (signal_id, timestamp,
-                     safe_float(data.get("ft_target")),
-                     safe_float(data.get("ft_high")),
-                     safe_float(data.get("ft_low")),
-                     safe_float(data.get("ft_actual_price")),
-                     safe_float(data.get("move_points")),
-                     data.get("result", "UNKNOWN"),
-                     data.get("state_before", "ELIGIBLE"),
-                     data.get("state_after", data.get("reputation", "ELIGIBLE")),
-                     safe_int(data.get("stops_after", data.get("consecutive_stops"))),
-                     safe_int(data.get("lockout_bars")),
-                     1 if is_ghost else 0))
-                conn.commit()
-                table_written = "evaluations"
-
-                # Ghost evals: silent, no user-visible Discord post, single 👻 log line
                 if is_ghost:
                     embed = None
                     target_channel = None
@@ -892,86 +809,166 @@ async def receive_webhook(request: Request, token: str = ""):
                     embed = build_eval_embed(data, signal_id, parent)
                     target_channel = CHANNELS.get("trade-journal")
 
-            # ============ ROUTE 3: TRADE_OUTCOME → trade_outcomes ============
-            elif status == "TRADE_OUTCOME":
-                signal_id = find_parent_by_lookback(signal_type, direction)
-
-                if not signal_id:
+            # ============ ROUTE 3: HEARTBEAT (Option C §3.4) ============
+            elif status == "HEARTBEAT":
+                bar_close_ms = safe_int(data.get("bar_close_ms"))
+                if bar_close_ms <= 0:
                     await log_error(
-                        "ORPHAN",
-                        f"OUTCOME {signal_type} {direction} rejected — no parent in last 2h",
-                        raw_snippet=raw_message
+                        "SCHEMA", "HEARTBEAT missing bar_close_ms",
+                        raw_snippet=raw_message,
                     )
-                    return {"status": "rejected", "reason": "no_parent"}
+                    raise HTTPException(status_code=400,
+                                        detail="HEARTBEAT missing bar_close_ms")
 
-                c.execute('''INSERT INTO trade_outcomes
-                    (signal_id, timestamp_opened, timestamp_closed,
-                     tp1_hit, tp1_hit_time, tp2_hit, tp2_hit_time,
-                     sl_hit, sl_hit_time, be_stop_hit, be_stop_hit_time,
-                     exit_reason, final_pnl_points,
-                     mae_points, mfe_points, mae_time_min, mfe_time_min,
-                     post_tp1_mae_points, time_in_trade_min, is_ghost)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                    (signal_id,
-                     data.get("timestamp_opened", timestamp),
-                     timestamp,
-                     safe_int(data.get("tp1_hit")),
-                     data.get("tp1_hit_time"),
-                     safe_int(data.get("tp2_hit")),
-                     data.get("tp2_hit_time"),
-                     safe_int(data.get("sl_hit")),
-                     data.get("sl_hit_time"),
-                     safe_int(data.get("be_stop_hit")),
-                     data.get("be_stop_hit_time"),
-                     data.get("exit_reason", "UNKNOWN"),
-                     safe_float(data.get("final_pnl_points")),
-                     safe_float(data.get("mae_points")),
-                     safe_float(data.get("mfe_points")),
-                     safe_int(data.get("mae_time_min")),
-                     safe_int(data.get("mfe_time_min")),
-                     safe_float(data.get("post_tp1_mae_points")),
-                     safe_int(data.get("time_in_trade_min")),
-                     safe_int(data.get("is_ghost"))))   # v3.1 provision, v3.0 Monitor always sends 0
-                conn.commit()
-                table_written = "trade_outcomes"
+                bar = Bar(
+                    bar_close_ms=bar_close_ms,
+                    open=safe_float(data.get("bar_open", data.get("open"))),
+                    high=safe_float(data.get("bar_high", data.get("high"))),
+                    low=safe_float(data.get("bar_low", data.get("low"))),
+                    close=safe_float(data.get("bar_close", data.get("close"))),
+                )
+                eod_cutoff = eod_cutoff_for_session_of(bar_close_ms)
 
-                # Monitor capacity warning if near overflow
-                slots_used = safe_int(data.get("monitor_slots_used"))
-                slots_max  = safe_int(data.get("monitor_slots_max"))
-                if slots_max > 0 and slots_used >= slots_max - 1:
-                    await log_monitor_warning(
-                        f"tracker near capacity ({slots_used}/{slots_max} slots)"
+                slot_times = [
+                    safe_int(data.get(f"pos_slot_{i}_time", 0))
+                    for i in range(1, 5)
+                ]
+                active_slots = [ms for ms in slot_times if ms > 0]
+
+                for slot_ms in active_slots:
+                    row = conn.execute(
+                        "SELECT signal_id FROM positions WHERE bar_close_ms=?",
+                        (slot_ms,),
+                    ).fetchone()
+                    if row is None:
+                        await log_monitor_warning(
+                            f"HEARTBEAT unknown position bar_close_ms={slot_ms}"
+                        )
+                        continue
+                    sid = row[0]
+                    before = _fsm_map.get(sid)
+                    route_heartbeat_for_position(
+                        signal_id=sid, bar=bar,
+                        fsm_map=_fsm_map, conn=conn,
+                        finnhub=_get_finnhub(),
+                        eod_cutoff_ms=eod_cutoff,
+                        post_embed=_outcome_sink,
+                        log=None,
                     )
+                    # Detect terminal close: position was in fsm_map before and
+                    # is gone now. Collect for Discord outcome post.
+                    after = _fsm_map.get(sid)
+                    if before is not None and after is None:
+                        resolver_closures.append(sid)
 
-                parent = get_parent_signal(signal_id)
-                embed = build_outcome_embed(data, signal_id, parent)
-                target_channel = CHANNELS.get("trade-journal")
+                signal_id = None  # heartbeat has no single signal_id
+                table_written = "positions" + (
+                    "+trade_outcomes" if resolver_closures else ""
+                )
 
+            # ============ RETIRED: TRADE_OUTCOME (Option C §3.5) ============
+            elif status == "TRADE_OUTCOME":
+                await log_error(
+                    "TRADE_OUTCOME_RETIRED",
+                    "TRADE_OUTCOME webhook received under Option C — retired "
+                    "(positions resolve via backend FSM, not Pine)",
+                    raw_snippet=raw_message,
+                )
+                return {"status": "rejected", "reason": "trade_outcome_retired"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Database error: {e}")
         await log_error("DB", f"{status}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
     # LOG LINE 2 of 3: database write committed (healthy path)
-    if not is_ghost and signal_id and table_written:
-        await log_written(status, signal_type, direction, signal_id, table_written)
+    if not is_ghost and table_written and (signal_id or resolver_closures):
+        await log_written(status, signal_type, direction,
+                          signal_id or 0, table_written)
 
     # ---- PHASE 3: Discord posting (non-critical) ----
     if embed and target_channel:
         try:
             await send_discord_message(target_channel, embed=embed)
-            # LOG LINE 3 of 3: user-visible embed posted (healthy path)
-            monitor_state = format_monitor_state(data) if status == "TRADE_OUTCOME" else None
-            await log_posted(status, signal_type, direction, signal_id, monitor_state)
+            await log_posted(status, signal_type, direction, signal_id or 0)
         except Exception as e:
             print(f"Discord embed post failed: {e}")
             await log_error("DISCORD", f"{status} #{signal_id} embed post failed: {str(e)}")
+
+    # HEARTBEAT closures — build + post one OUTCOME embed per closed position.
+    for closed_sid in resolver_closures:
+        try:
+            outcome_payload = next(
+                (p for p in _captured_outcomes if p.get("signal_id") == closed_sid),
+                None,
+            )
+            parent_row = get_parent_signal(closed_sid)
+            closed_row = _fetch_closed_outcome(closed_sid)
+            if closed_row:
+                outcome_embed = build_outcome_embed(
+                    closed_row, closed_sid, parent_row,
+                )
+                await send_discord_message(
+                    CHANNELS.get("trade-journal"), embed=outcome_embed,
+                )
+                await log_posted(
+                    "OUTCOME",
+                    parent_row.get("signal_type") if parent_row else "",
+                    parent_row.get("signal") if parent_row else "",
+                    closed_sid,
+                )
+        except Exception as e:
+            print(f"Outcome embed post failed for {closed_sid}: {e}")
+            await log_error("DISCORD",
+                            f"OUTCOME #{closed_sid} post failed: {e}")
 
     # Ghost events: single 👻 line in place of the three healthy prefixes
     if is_ghost and signal_id:
         await log_ghost(signal_type, direction, signal_id, data.get("result", "UNKNOWN"))
 
-    return {"status": "ok", "action": status, "signal_id": signal_id, "ghost": is_ghost}
+    return {
+        "status": "ok",
+        "action": status,
+        "signal_id": signal_id,
+        "closures": resolver_closures,
+        "ghost": is_ghost,
+    }
+
+
+_RESOLVER_EXIT_TO_EMBED_LABEL = {
+    "TP2_HIT":     "TP1_TP2",
+    "BE_STOP":     "TP1_BE",
+    "SL_HIT":      "SL_FULL",
+    "EOD_TIMEOUT": "EOD_TIMEOUT",
+    "GAP_CLEAN":   "GAP_CLEAN",
+}
+
+
+def _fetch_closed_outcome(signal_id: int) -> dict:
+    """Load the trade_outcomes row written by the resolver, translated into
+    the dict shape `build_outcome_embed` expects."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                '''SELECT * FROM trade_outcomes
+                   WHERE signal_id=?
+                   ORDER BY outcome_id DESC LIMIT 1''',
+                (signal_id,),
+            ).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            resolver_reason = d.get("exit_reason")
+            d["exit_reason"] = _RESOLVER_EXIT_TO_EMBED_LABEL.get(
+                resolver_reason, resolver_reason,
+            )
+            return d
+    except Exception as e:
+        print(f"_fetch_closed_outcome error: {e}")
+        return None
 
 
 # =============================================================
@@ -980,10 +977,28 @@ async def receive_webhook(request: Request, token: str = ""):
 
 @app.on_event("startup")
 async def startup():
+    """Option C startup ordering (§8.4):
+      1. init_db (schema)
+      2. rehydrate fsm_map from positions table
+      3. EOD sweep — close any position whose session already ended
+      4. accept webhooks (FastAPI is already bound; we just populate state)
+    """
     init_db()
     print(f"Database initialized at {DB_PATH}")
     print(f"Webhook auth: {'ENABLED' if WEBHOOK_AUTH_TOKEN else 'DISABLED'}")
     print(f"Channel mapping: {[k for k,v in CHANNELS.items() if v]}")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        rehydrated = rehydrate_positions(conn)
+        _fsm_map.update(rehydrated)
+        if rehydrated:
+            current_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            eod_sweep(
+                _fsm_map, conn, current_ms,
+                post_embed=_outcome_sink, log=None,
+            )
+    print(f"Rehydrated {len(_fsm_map)} open position(s)")
 
     et_now = get_et_now()
     auth_status = "\U0001f512 AUTH" if WEBHOOK_AUTH_TOKEN else "\U0001f513 OPEN"
@@ -991,6 +1006,8 @@ async def startup():
         CHANNELS.get("mona-log"),
         content=(
             f"\U0001f7e2 **The Mona v{VERSION} DB Connected** \u2014 "
-            f"{et_now.strftime('%I:%M %p ET')} \u2022 {auth_status} \u2022 WAL ON \u2022 3-TABLE SCHEMA"
+            f"{et_now.strftime('%I:%M %p ET')} \u2022 {auth_status} \u2022 "
+            f"WAL ON \u2022 OPTION C SCHEMA \u2022 "
+            f"{len(_fsm_map)} open position(s)"
         )
     )

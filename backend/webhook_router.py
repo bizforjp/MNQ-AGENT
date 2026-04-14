@@ -195,7 +195,7 @@ def _route_eval_v3(payload, parent_bar_close_ms, *, conn, log=None):
 # HEARTBEAT (per-position)
 # ----------------------------------------------------------------------
 def route_heartbeat_for_position(*, signal_id, bar, fsm_map, conn, finnhub,
-                                 eod_cutoff_ms, log=None):
+                                 eod_cutoff_ms, post_embed=None, log=None):
     """
     Process one slot of a heartbeat for one open position.
 
@@ -233,7 +233,8 @@ def route_heartbeat_for_position(*, signal_id, bar, fsm_map, conn, finnhub,
             current_bar_ms=bar.bar_close_ms - BAR_INTERVAL_MS,
             trigger="heartbeat_gap",
             fsm_map=fsm_map, conn=conn, finnhub=finnhub,
-            eod_cutoff_ms=eod_cutoff_ms, log=log,
+            eod_cutoff_ms=eod_cutoff_ms,
+            post_embed=post_embed, log=log,
         )
         # Recovery may have closed the position.
         position = fsm_map.get(signal_id)
@@ -246,5 +247,6 @@ def route_heartbeat_for_position(*, signal_id, bar, fsm_map, conn, finnhub,
 
     # Normal live step.
     result = step(position, bar, eod_cutoff_ms=eod_cutoff_ms)
-    apply_resolver_result(position, bar, result, fsm_map, conn, log=log)
+    apply_resolver_result(position, bar, result, fsm_map, conn,
+                          post_embed=post_embed, log=log)
     return result
