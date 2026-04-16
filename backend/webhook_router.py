@@ -29,14 +29,9 @@ from backend.schema import BAR_INTERVAL_MS
 # ----------------------------------------------------------------------
 def route_entry(payload, *, fsm_map, conn, log=None):
     """
-    Tolerance dispatcher for ENTRY. Presence of `bar_close_ms` picks v3;
-    absence picks legacy v2 write to the `signals` table.
-    Returns the new signal_id for v3 payloads, or None for legacy.
+    ENTRY writes go to signals_v3 only. Returns the new signal_id.
     """
     bar_close_ms = payload.get("bar_close_ms")
-    if bar_close_ms in (None, 0, "", "0"):
-        return _route_entry_legacy(payload, conn=conn, log=log)
-
     try:
         bar_close_ms_int = int(float(bar_close_ms))
     except (TypeError, ValueError):
@@ -88,33 +83,6 @@ def route_entry(payload, *, fsm_map, conn, log=None):
     if log:
         log("ENTRY_V3", signal_id=signal_id, bar_close_ms=bar_close_ms_int)
     return signal_id
-
-
-def _route_entry_legacy(payload, *, conn, log=None):
-    direction = int(payload.get("sig_dir", 1))
-    signal_type = int(payload.get("sig_type", 1))
-    conn.execute(
-        """
-        INSERT INTO signals (
-            timestamp, signal, signal_type,
-            entry_price, sl, tp1, tp2, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.get("timestamp", ""),
-            "LONG" if direction == Direction.LONG else "SHORT",
-            "TREND" if signal_type == 1 else "SQUEEZE",
-            float(payload.get("entry_price", 0)),
-            float(payload.get("sl", 0)),
-            float(payload.get("tp1", 0)),
-            float(payload.get("tp2", 0)),
-            json.dumps(payload),
-        ),
-    )
-    conn.commit()
-    if log:
-        log("ENTRY_LEGACY", timestamp=payload.get("timestamp", ""))
-    return None
 
 
 # ----------------------------------------------------------------------
