@@ -386,3 +386,112 @@ def test_TC35_gap_clean_fallback_no_observation(db):
     # Log carries both the distinct staleness tag and GAP_CLEAN
     assert log.find("STALENESS_NEVER_HEARTBEATED")
     assert log.find("GAP_CLEAN")
+
+
+# ======================================================================
+# Regression: ENTRY → HEARTBEAT → second ENTRY must not collide
+# ======================================================================
+def test_entry_heartbeat_entry_no_collision(db):
+    """
+    Bug 1 regression: heartbeats must never write to signals_v3, and two
+    entries on different bars must both succeed. Also verifies that
+    bar_close_ms=0 is rejected as a likely unresolved template tag.
+    """
+    fsm_map: dict = {}
+    log = LogCapture()
+    finnhub = FakeFinnhub()
+    embeds = EmbedCapture()
+
+    entry1_ms = T
+    entry2_ms = T_5  # different bar
+
+    # --- ENTRY 1: TREND SHORT ---
+    e1 = {
+        "sig_dir": 2, "sig_type": 1,
+        "entry_price": 25050.0, "sl": 25080.0,
+        "tp1": 25020.0, "tp2": 24990.0,
+        "bar_close_ms": entry1_ms,
+        "timestamp": "2026-04-13 10:00:00",
+    }
+    sid1 = route_entry(e1, fsm_map=fsm_map, conn=db, log=log)
+    assert sid1 is not None, "first ENTRY must succeed"
+
+    # --- HEARTBEAT on bars T+1 through T+4 ---
+    for i in range(1, 5):
+        hb_ms = entry1_ms + i * BAR_INTERVAL_MS
+        bar = Bar(bar_close_ms=hb_ms, open=25045, high=25055, low=25035, close=25040)
+        eod = _ms(2026, 4, 13, 16, 0)
+        route_heartbeat_for_position(
+            signal_id=sid1, bar=bar, fsm_map=fsm_map, conn=db,
+            finnhub=finnhub, eod_cutoff_ms=eod,
+            post_embed=embeds, log=log,
+        )
+
+    # signals_v3 must still have exactly 1 row — heartbeats must not write here
+    sv3_count = db.execute("SELECT COUNT(*) FROM signals_v3").fetchone()[0]
+    assert sv3_count == 1, f"heartbeats should not write to signals_v3, got {sv3_count}"
+
+    # --- ENTRY 2: SQUEEZE LONG on a different bar ---
+    e2 = {
+        "sig_dir": 1, "sig_type": 2,
+        "entry_price": 25060.0, "sl": 25040.0,
+        "tp1": 25090.0, "tp2": 25120.0,
+        "bar_close_ms": entry2_ms,
+        "timestamp": "2026-04-13 11:15:00",
+    }
+    sid2 = route_entry(e2, fsm_map=fsm_map, conn=db, log=log)
+    assert sid2 is not None, "second ENTRY on a different bar must succeed"
+
+    # Both entries are in signals_v3
+    sv3_count = db.execute("SELECT COUNT(*) FROM signals_v3").fetchone()[0]
+    assert sv3_count == 2
+
+    # Both positions in fsm_map
+    assert sid1 in fsm_map
+    assert sid2 in fsm_map
+
+    # --- ENTRY 3: bar_close_ms=0 must be rejected ---
+    e3 = {
+        "sig_dir": 1, "sig_type": 1,
+        "entry_price": 25070.0, "sl": 25050.0,
+        "tp1": 25100.0, "tp2": 25130.0,
+        "bar_close_ms": 0,
+        "timestamp": "2026-04-13 12:00:00",
+    }
+    sid3 = route_entry(e3, fsm_map=fsm_map, conn=db, log=log)
+    assert sid3 is None, "bar_close_ms=0 must be rejected"
+
+    # signals_v3 still has 2 rows, not 3
+    sv3_count = db.execute("SELECT COUNT(*) FROM signals_v3").fetchone()[0]
+    assert sv3_count == 2
+
+
+def test_same_bar_trend_and_squeeze_both_succeed(db):
+    """
+    With the composite UNIQUE(bar_close_ms, signal_type), TREND and
+    SQUEEZE entries on the same bar must both succeed.
+    """
+    fsm_map: dict = {}
+    log = LogCapture()
+    same_bar_ms = T
+
+    e_trend = {
+        "sig_dir": 1, "sig_type": 1,
+        "entry_price": 25000.0, "sl": 24980.0,
+        "tp1": 25030.0, "tp2": 25050.0,
+        "bar_close_ms": same_bar_ms,
+        "timestamp": "2026-04-13 10:00:00",
+    }
+    sid_t = route_entry(e_trend, fsm_map=fsm_map, conn=db, log=log)
+    assert sid_t is not None
+
+    e_sqz = {
+        "sig_dir": 2, "sig_type": 2,
+        "entry_price": 25000.0, "sl": 25020.0,
+        "tp1": 24970.0, "tp2": 24940.0,
+        "bar_close_ms": same_bar_ms,
+        "timestamp": "2026-04-13 10:00:00",
+    }
+    sid_s = route_entry(e_sqz, fsm_map=fsm_map, conn=db, log=log)
+    assert sid_s is not None, "SQUEEZE on same bar as TREND must succeed"
+    assert sid_t != sid_s

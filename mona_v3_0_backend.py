@@ -44,6 +44,7 @@ import aiohttp
 from backend.schema import (
     init_db as schema_init_db,
     migrate_add_bar_close_ms_to_signals_v3,
+    migrate_add_payload_json_to_eval_results,
     BAR_INTERVAL_MS,
 )
 from backend.webhook_router import (
@@ -238,6 +239,7 @@ def init_db():
         conn.execute("PRAGMA foreign_keys = ON")
         schema_init_db(conn)
         migrate_add_bar_close_ms_to_signals_v3(conn)
+        migrate_add_payload_json_to_eval_results(conn)
 
 
 def get_parent_signal(signal_id: int) -> dict:
@@ -475,9 +477,11 @@ def build_entry_embed(data, signal_id):
         fields.append({"name": "\U0001f4b0 Trade Levels", "value": levels_text, "inline": False})
 
     if atr:
+        vol = safe_float(data.get('volume_ratio'))
+        vol_str = f"{vol:.2f}x" if vol >= 0.01 else "N/A"
         fields.append({
             "name": "\U0001f4ca Context",
-            "value": f"ATR: {atr:.2f} pts  \u2022  ADX: {safe_float(data.get('adx')):.1f}  \u2022  Vol: {safe_float(data.get('volume_ratio')):.2f}x",
+            "value": f"ATR: {atr:.2f} pts  \u2022  ADX: {safe_float(data.get('adx')):.1f}  \u2022  Vol: {vol_str}",
             "inline": False
         })
 
@@ -689,6 +693,37 @@ async def health():
     }
 
 
+# ---- TEMPORARY diagnostic endpoint — remove after April 19 debug session ----
+@app.get("/debug/signals")
+async def debug_signals():
+    """Dump signals_v3, positions, and eval_results schema for diagnosis."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        signals = [dict(r) for r in conn.execute(
+            "SELECT signal_id, bar_close_ms, signal_type, signal, timestamp "
+            "FROM signals_v3 ORDER BY signal_id"
+        ).fetchall()]
+        positions = [dict(r) for r in conn.execute(
+            "SELECT signal_id, bar_close_ms, state, direction, "
+            "heartbeats_processed, last_heartbeat_bar_ms, "
+            "last_observed_close, opened_at_ms, exit_reason "
+            "FROM positions ORDER BY signal_id"
+        ).fetchall()]
+        eval_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='eval_results'"
+        ).fetchone()
+        sv3_indexes = [dict(r) for r in conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type='index' AND tbl_name='signals_v3'"
+        ).fetchall()]
+    return {
+        "signals_v3": signals,
+        "positions": positions,
+        "eval_results_schema": dict(eval_schema) if eval_schema else None,
+        "signals_v3_indexes": sv3_indexes,
+    }
+
+
 @app.post("/webhook")
 async def receive_webhook(request: Request, token: str = ""):
     # ---- PHASE 0: Auth ----
@@ -878,6 +913,20 @@ async def receive_webhook(request: Request, token: str = ""):
 
     except HTTPException:
         raise
+    except sqlite3.IntegrityError as e:
+        # §4.2 UNIQUE_VIOLATION loud-logging: post to #system-log.
+        violation = data.get("_unique_violation")
+        if violation:
+            detail_msg = (
+                f"bar_close_ms={violation['bar_close_ms']} "
+                f"attempted={violation['attempted_type']} {violation['attempted_dir']} "
+                f"existing=#{violation['existing_id']} {violation['existing_type']} "
+                f"{violation['existing_dir']}"
+            )
+            await log_error("UNIQUE_VIOLATION", detail_msg, raw_snippet=raw_message)
+        else:
+            await log_error("DB", f"{status}: {str(e)}")
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         print(f"Database error: {e}")
         await log_error("DB", f"{status}: {str(e)}")

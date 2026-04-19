@@ -13,6 +13,7 @@ or before last_heartbeat_bar_ms) are rejected with a REPLAY log line and
 the resolver is NOT called.
 """
 import json
+import sqlite3
 
 from backend.apply_resolver_result import (
     apply_resolver_result, insert_position_row, insert_signal_row,
@@ -40,30 +41,69 @@ def route_entry(payload, *, fsm_map, conn, log=None):
                 value=repr(bar_close_ms))
         return None
 
+    # Guard: bar_close_ms must be a real timestamp, not zero from an
+    # unresolved TradingView {{plot_N}} template tag.
+    if bar_close_ms_int <= 0:
+        print(f"[ENTRY_REJECTED] bar_close_ms={bar_close_ms_int} — likely "
+              "unresolved {{plot}} template; rejecting to prevent UNIQUE collision")
+        if log:
+            log("SCHEMA", message="bar_close_ms <= 0 on v3 ENTRY — rejected",
+                raw_value=repr(bar_close_ms))
+        return None
+
     direction = int(payload.get("sig_dir", 1))
     signal_type = int(payload.get("sig_type", 1))
+    signal_type_str = "TREND" if signal_type == 1 else "SQUEEZE"
+    direction_str = "LONG" if direction == Direction.LONG else "SHORT"
 
     # Insert signals_v3 row first (FK target for positions).
-    cur = conn.execute(
-        """
-        INSERT INTO signals_v3 (
-            timestamp, signal, signal_type,
-            entry_price, sl, tp1, tp2, stop_pts,
-            bar_close_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.get("timestamp", ""),
-            "LONG" if direction == Direction.LONG else "SHORT",
-            "TREND" if signal_type == 1 else "SQUEEZE",
-            float(payload.get("entry_price", 0)),
-            float(payload.get("sl", 0)),
-            float(payload.get("tp1", 0)),
-            float(payload.get("tp2", 0)),
-            abs(float(payload.get("sl", 0)) - float(payload.get("entry_price", 0))),
-            bar_close_ms_int,
-        ),
-    )
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO signals_v3 (
+                timestamp, signal, signal_type,
+                entry_price, sl, tp1, tp2, stop_pts,
+                bar_close_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload.get("timestamp", ""),
+                direction_str,
+                signal_type_str,
+                float(payload.get("entry_price", 0)),
+                float(payload.get("sl", 0)),
+                float(payload.get("tp1", 0)),
+                float(payload.get("tp2", 0)),
+                abs(float(payload.get("sl", 0)) - float(payload.get("entry_price", 0))),
+                bar_close_ms_int,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        # §4.2 UNIQUE_VIOLATION loud-logging commitment.
+        existing = conn.execute(
+            "SELECT signal_id, signal_type, signal FROM signals_v3 "
+            "WHERE bar_close_ms = ? LIMIT 1",
+            (bar_close_ms_int,),
+        ).fetchone()
+        existing_id = existing[0] if existing else "?"
+        existing_type = existing[1] if existing else "?"
+        existing_dir = existing[2] if existing else "?"
+        print(
+            f"❌ [UNIQUE_VIOLATION] signals_v3 bar_close_ms={bar_close_ms_int} "
+            f"attempted={signal_type_str} {direction_str} "
+            f"existing=#{existing_id} {existing_type} {existing_dir}"
+        )
+        # Store violation details on the payload so the webhook handler can
+        # post a loud log embed to #system-log.
+        payload["_unique_violation"] = {
+            "bar_close_ms": bar_close_ms_int,
+            "attempted_type": signal_type_str,
+            "attempted_dir": direction_str,
+            "existing_id": existing_id,
+            "existing_type": existing_type,
+            "existing_dir": existing_dir,
+        }
+        raise
     signal_id = cur.lastrowid
 
     pos = new_position(

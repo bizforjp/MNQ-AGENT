@@ -75,8 +75,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
     """)
     c.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_v3_bar_close_ms
-          ON signals_v3(bar_close_ms)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_v3_bar_close_ms_type
+          ON signals_v3(bar_close_ms, signal_type)
           WHERE bar_close_ms IS NOT NULL
     """)
 
@@ -215,13 +215,31 @@ def migrate_add_bar_close_ms_to_signals_v3(conn: sqlite3.Connection) -> None:
     """
     Additive migration for databases that already have signals_v3 without
     the bar_close_ms column. Safe to run against a fresh DB (no-op).
+
+    Also replaces the old single-column UNIQUE(bar_close_ms) index with
+    the composite UNIQUE(bar_close_ms, signal_type) index, so that
+    legitimate same-bar TREND+SQUEEZE entries don't collide.
     """
     c = conn.cursor()
     cols = {row[1] for row in c.execute("PRAGMA table_info(signals_v3)").fetchall()}
     if "bar_close_ms" not in cols:
         c.execute("ALTER TABLE signals_v3 ADD COLUMN bar_close_ms INTEGER")
+    # Drop the old single-column index if it exists, replace with composite.
+    c.execute("DROP INDEX IF EXISTS idx_signals_v3_bar_close_ms")
     c.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_v3_bar_close_ms "
-        "ON signals_v3(bar_close_ms) WHERE bar_close_ms IS NOT NULL"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_v3_bar_close_ms_type "
+        "ON signals_v3(bar_close_ms, signal_type) WHERE bar_close_ms IS NOT NULL"
     )
     conn.commit()
+
+
+def migrate_add_payload_json_to_eval_results(conn: sqlite3.Connection) -> None:
+    """
+    Additive migration: adds the payload_json column to the legacy
+    eval_results table if it was created before that column existed.
+    """
+    c = conn.cursor()
+    cols = {row[1] for row in c.execute("PRAGMA table_info(eval_results)").fetchall()}
+    if "payload_json" not in cols:
+        c.execute("ALTER TABLE eval_results ADD COLUMN payload_json TEXT")
+        conn.commit()
