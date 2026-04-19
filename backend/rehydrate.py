@@ -164,8 +164,17 @@ def eod_sweep(fsm_map, conn, current_ms,
     resolver's EOD branch fire.
     """
     to_close = []
+    zombies = []
     for sid, pos in list(fsm_map.items()):
         if pos.state == PositionFSMState.CLOSED:
+            continue
+        # Zombie guard: positions with opened_at_ms <= 0 came from an
+        # unresolved {{plot}} template (bar_close_ms=0). The session
+        # cutoff for epoch/pre-epoch dates is negative, which crashes
+        # the resolver invariant check. Close these directly as
+        # GAP_CLEAN without going through the resolver.
+        if pos.opened_at_ms <= 0:
+            zombies.append((sid, pos))
             continue
         # 16:00 ET of the session date the position was opened on.
         session_cutoff = eod_cutoff_for_session_of(pos.opened_at_ms)
@@ -173,6 +182,18 @@ def eod_sweep(fsm_map, conn, current_ms,
             to_close.append((sid, pos, session_cutoff))
 
     from backend.apply_resolver_result import apply_resolver_result
+    from backend.gap_recovery import close_gap_clean
+
+    # Close zombie positions (bar_close_ms=0) as GAP_CLEAN.
+    for sid, pos in zombies:
+        print(f"⚠️ [ZOMBIE] signal_id={sid} opened_at_ms={pos.opened_at_ms} "
+              "— closing as GAP_CLEAN (invalid bar_close_ms)")
+        close_gap_clean(
+            pos, exit_bar_ms=current_ms,
+            reason="ZOMBIE_INVALID_BAR_CLOSE_MS",
+            fsm_map=fsm_map, conn=conn,
+            post_embed=post_embed, log=log,
+        )
 
     for sid, pos, session_cutoff in to_close:
         price = pos.last_observed_close if pos.last_observed_close else pos.entry_price
