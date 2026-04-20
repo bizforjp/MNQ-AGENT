@@ -1,14 +1,14 @@
 //@version=5
-indicator("MNQ Agent v3.1 — Reputation Engine (alert transport)", overlay=true, max_labels_count=500, max_bars_back=500)
+indicator("MNQ Agent v3.2 — alert() transport", overlay=true, max_labels_count=500, max_bars_back=500)
 
 // ============================================================================
-// THE MONA v3.1 — Signal Generator (alert() transport)
+// THE MONA v3.2 — Signal Generator (alert() transport)
 // ============================================================================
 // Changes from v3.0 (Option C with alertcondition + {{plot_N}} template tags):
 //   - Transport layer rewritten: alertcondition() -> alert()
 //   - JSON payloads built directly in Pine via str.tostring() concatenation
 //   - Hidden data plots (0..41) removed — no longer needed to feed template
-//   - Version bumped to "3.1" so backend can distinguish migrated signals
+//   - Version bumped to "3.2" so backend can distinguish migrated signals
 //   - Title differs from v3.0 so both can coexist on chart during swap
 //
 // Why this exists:
@@ -765,7 +765,7 @@ if sessionEnded
 //
 // TradingView setup:
 //   - Create ONE alert on this indicator
-//   - Condition: "MNQ Agent v3.1 — ..." -> "Any alert() function call"
+//   - Condition: "MNQ Agent v3.2 — ..." -> "Any alert() function call"
 //   - Message:   {{alert_message}}  (TV substitutes the Pine-built string)
 //   - Webhook:   Railway endpoint
 // One alert catches both ENTRY/EVAL and HEARTBEAT firings — that's why we
@@ -811,7 +811,7 @@ if barstate.isconfirmed and (fireTrendAlert or fireSqzAlert)
       + ',"bar_close_ms":'                + str.tostring(time_close)
       + ',"parent_bar_close_ms":'         + str.tostring(nz(sigParentBarCloseMs, 0))
       + ',"ticker":"MNQ"'
-      + ',"version":"3.1"}'
+      + ',"version":"3.2"}'
     alert(entryPayload, alert.freq_once_per_bar_close)
 
 // ---- HEARTBEAT alert ----
@@ -833,7 +833,7 @@ if fireHeartbeat
       + ',"pos_slot_3_time":'  + str.tostring(posSlot3Time)
       + ',"pos_slot_4_time":'  + str.tostring(posSlot4Time)
       + ',"ticker":"MNQ"'
-      + ',"version":"3.1"}'
+      + ',"version":"3.2"}'
     alert(heartbeatPayload, alert.freq_once_per_bar_close)
 
 
