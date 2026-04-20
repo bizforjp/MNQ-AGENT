@@ -739,29 +739,6 @@ async def receive_webhook(request: Request, token: str = ""):
         await log_error("PARSE", "empty message body")
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # Forensic log: raw wire-bytes of every webhook body.
-    # Useful throughout the alert() transport migration — shows whether
-    # Pine is sending real values or leaked {{plot_N}} literals.
-    print(f"[WEBHOOK_RAW_BODY] {raw_message}")
-
-    # ---- Phase 1 alert() verification short-circuit ----
-    # {"test": true, ...} payloads bypass sanitize_json, translate_payload,
-    # all DB writes, and Discord posting. Probe-parse the raw body; if that
-    # fails, fall through to the normal sanitize+parse path so production
-    # alertcondition payloads keep working.
-    try:
-        _probe = json.loads(raw_message)
-    except json.JSONDecodeError:
-        _probe = None
-    if isinstance(_probe, dict) and _probe.get("test") is True:
-        print(
-            f"[TRANSPORT_TEST] bar_close_ms={_probe.get('bar_close_ms')!r} "
-            f"price={_probe.get('price')!r} ticker={_probe.get('ticker')!r} "
-            f"| full={_probe}"
-        )
-        return {"status": "ok", "test": True}
-    # ---- end Phase 1 short-circuit ----
-
     # ---- PHASE 1: Parse ----
     try:
         cleaned = sanitize_json(raw_message)
