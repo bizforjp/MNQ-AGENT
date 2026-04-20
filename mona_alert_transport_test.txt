@@ -1,0 +1,29 @@
+//@version=5
+indicator("Mona alert() Transport Test", overlay=false)
+
+// =============================================================
+// Phase 1 verification — does alert() reach the backend with
+// real values? This script has no signal logic, no plots.
+// It fires once per confirmed bar with a minimal JSON payload.
+//
+// Pass criteria (check Railway logs):
+//   [WEBHOOK_RAW_BODY]  {"test":true,"ticker":"MNQ","bar_close_ms":<13-digit ms>,"price":"<MNQ close>"}
+//   [TRANSPORT_TEST]    bar_close_ms=<int> price='<str>' ticker='MNQ'
+//
+// TradingView setup:
+//   1. Pine Editor → paste this → Save → Add to chart (MNQ1! 15m)
+//   2. Right-click chart → Add Alert
+//   3. Condition:  "Mona alert() Transport Test" → "Any alert() function call"
+//   4. Message:    leave as {{alert_message}}  (TV substitutes the Pine string)
+//   5. Webhook URL: same Railway URL the production alert uses
+//   6. Expiration: max allowed
+//   7. Alert name: MONA-ALERT-TEST
+//
+// Remove this indicator and its alert after Phase 1 passes.
+// =============================================================
+
+if barstate.isconfirmed
+    payload = '{"test":true,"ticker":"MNQ","bar_close_ms":' +
+              str.tostring(time_close) + ',"price":"' +
+              str.tostring(close, "#.##") + '"}'
+    alert(payload, alert.freq_once_per_bar_close)
