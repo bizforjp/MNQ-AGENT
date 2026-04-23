@@ -2,13 +2,21 @@
 Gap recovery — §8.6 / §8.8.
 
 Decision tree (summarised from §8.6):
-  gap_bars == 0                   -> no-op (session-boundary cleanup)
-  gap_bars > MAX_REPLAY_BARS      -> close GAP_CLEAN, reason GAP_EXCEEDS_MAX
-  Finnhub raises                  -> close GAP_CLEAN, reason FINNHUB_UNAVAILABLE
-  reconcile fails                 -> close GAP_CLEAN, reason RECONCILE_FAIL
+  gap_bars == 0                                  -> no-op
+  gap_bars > MAX_REPLAY_BARS                     -> close GAP_CLEAN, GAP_EXCEEDS_MAX
+  Finnhub raises, heartbeat_gap + gap_bars <= 2  -> fail-soft (position lives)
+  Finnhub raises, otherwise                      -> close GAP_CLEAN, FINNHUB_UNAVAILABLE
+  reconcile fails                                -> close GAP_CLEAN, RECONCILE_FAIL
   replay feeds resolver;
-  if a replayed bar closes pos    -> apply_resolver_result writes outcome
-  replay completes still-open     -> continue (position lives on)
+  if a replayed bar closes pos                   -> apply_resolver_result writes outcome
+  replay completes still-open                    -> continue (position lives on)
+
+Fail-soft is gated on trigger=="heartbeat_gap" because the heartbeat path has
+a live bar queued up in route_heartbeat_for_position that will call step() and
+advance last_heartbeat_bar_ms. The staleness path has no following live bar,
+so failing soft there would leak a stuck OPEN position. Motivation: TradingView
+occasionally drops a single heartbeat; killing the position when Finnhub is
+also unavailable is worse than accepting the MAE/MFE blind spot for one bar.
 
 All GAP_CLEAN exit_reasons on trade_outcomes are the literal string "GAP_CLEAN"
 (GR1). The specific cause lives only in the log line.
@@ -33,6 +41,8 @@ from backend.position_resolver import (
     step,
 )
 from backend.schema import BAR_INTERVAL_MS, MAX_REPLAY_BARS
+
+SMALL_GAP_FAIL_SOFT_BARS = 2
 
 
 # ----------------------------------------------------------------------
@@ -141,6 +151,25 @@ def invoke_gap_recovery(position, last_seen_ms, current_bar_ms, trigger,
             interval="15m",
         )
     except FinnhubError:
+        # Fail-soft only on the heartbeat path: a live bar is about to call
+        # step() and advance last_heartbeat_bar_ms. The staleness path has no
+        # live bar following — failing soft there would leak a stuck OPEN
+        # position that re-trips on every sweep.
+        if (trigger == "heartbeat_gap"
+                and gap_bars <= SMALL_GAP_FAIL_SOFT_BARS):
+            print(
+                f"⚠️ [GAP_RECOVERY] signal_id={position.signal_id} "
+                f"FINNHUB_UNAVAILABLE on {gap_bars}-bar gap "
+                f"(<= {SMALL_GAP_FAIL_SOFT_BARS}) — failing soft, "
+                f"position remains OPEN, live bar will advance state"
+            )
+            if log:
+                log("FINNHUB_UNAVAILABLE_FAIL_SOFT",
+                    signal_id=position.signal_id,
+                    gap_bars=gap_bars,
+                    last_seen_ms=last_seen_ms,
+                    trigger=trigger)
+            return
         close_gap_clean(
             position, exit_bar_ms=last_seen_ms,
             reason="FINNHUB_UNAVAILABLE",
