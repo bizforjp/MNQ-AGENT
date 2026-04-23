@@ -255,6 +255,27 @@ def route_heartbeat_for_position(*, signal_id, bar, fsm_map, conn, finnhub,
 
     # Normal live step.
     result = step(position, bar, eod_cutoff_ms=eod_cutoff_ms)
+    if position.direction == Direction.SHORT:
+        _log_short_audit(position, bar, result)
     apply_resolver_result(position, bar, result, fsm_map, conn,
                           post_embed=post_embed, log=log)
     return result
+
+
+def _log_short_audit(position, bar, result):
+    """SHORT-side bar/level dump for cross-checking vs TradingView."""
+    up = result.updated_position
+    print(
+        f"[SHORT_RESOLVER_AUDIT] sid={position.signal_id} "
+        f"bar_close_ms={bar.bar_close_ms} "
+        f"O={bar.open} H={bar.high} L={bar.low} C={bar.close} "
+        f"entry={position.entry_price} sl={position.sl} "
+        f"tp1={position.tp1} tp2={position.tp2} "
+        f"eff_sl={position.effective_sl} "
+        f"state_before={int(position.state)} "
+        f"transition={result.transition.value} "
+        f"notes={list(result.notes)} "
+        f"mae={up.mae_points} mfe={up.mfe_points} "
+        f"pnl={up.final_pnl_points}",
+        flush=True,
+    )
