@@ -693,37 +693,6 @@ async def health():
     }
 
 
-# ---- TEMPORARY diagnostic endpoint — remove after April 19 debug session ----
-@app.get("/debug/signals")
-async def debug_signals():
-    """Dump signals_v3, positions, and eval_results schema for diagnosis."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        signals = [dict(r) for r in conn.execute(
-            "SELECT signal_id, bar_close_ms, signal_type, signal, timestamp "
-            "FROM signals_v3 ORDER BY signal_id"
-        ).fetchall()]
-        positions = [dict(r) for r in conn.execute(
-            "SELECT signal_id, bar_close_ms, state, direction, "
-            "heartbeats_processed, last_heartbeat_bar_ms, "
-            "last_observed_close, opened_at_ms, exit_reason "
-            "FROM positions ORDER BY signal_id"
-        ).fetchall()]
-        eval_schema = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='eval_results'"
-        ).fetchone()
-        sv3_indexes = [dict(r) for r in conn.execute(
-            "SELECT name, sql FROM sqlite_master "
-            "WHERE type='index' AND tbl_name='signals_v3'"
-        ).fetchall()]
-    return {
-        "signals_v3": signals,
-        "positions": positions,
-        "eval_results_schema": dict(eval_schema) if eval_schema else None,
-        "signals_v3_indexes": sv3_indexes,
-    }
-
-
 @app.post("/webhook")
 async def receive_webhook(request: Request, token: str = ""):
     # ---- PHASE 0: Auth ----
